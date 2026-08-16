@@ -83,6 +83,38 @@ pub mod op {
     pub const BIN_CAT: u8 = 44; //  rd, ra, rb (binary append)
     pub const LIST_CAT: u8 = 45; // rd, ra, rb (erlang ++: ra proper list)
     pub const BIN_PART: u8 = 46; // rd, rbin, roff, rlen (bounds-checked slice)
+    /// Tail external call: module_atom:u32, fname_atom:u32, nargs:u8, nargs*r.
+    /// Terminal (no destination): the engine unwinds to its trampoline, which
+    /// re-dispatches — constant native stack, and the GC-safe point.
+    pub const TAIL_CALL_EXT: u8 = 47;
+    /// All-register submit: rport, rop, rarg0, rarg1, rtag — exposes
+    /// `Sqe.arg1` (cmd+aux buffer pairs) and makes the op/tag dynamic, which
+    /// is what device protocols written in bytecode need. tag -1 = no CQE.
+    pub const PORT_SUBMIT2: u8 = 48;
+    /// Tail local call: fn:u32, nargs:u8, nargs*r. Terminal like
+    /// `TAIL_CALL_EXT`, but the trampoline re-enters the *same module
+    /// instance* by function index — no name resolution, and BEAM local-call
+    /// semantics (no version migration). For multi-function modules; Lux
+    /// function-modules instead tail-call themselves by their own
+    /// content-address (self-references are canonicalized before hashing,
+    /// so a module's code can and does name its own hash).
+    pub const TAIL_CALL: u8 = 49;
+    /// rd, rbuf, roff, rbin: overwrite bytes of an existing kernel buffer at
+    /// an offset (bounds-checked, never grows — a pinned buffer's physical
+    /// address stays valid). The device-backing update path: how a bytecode
+    /// driver animates a framebuffer it has attached. Result int 0.
+    pub const BUF_WRITE: u8 = 50;
+    /// rms: park the process for that many milliseconds without consuming a
+    /// mailbox message (timer-wheel sleep; lowers `receive after` pacing).
+    pub const SLEEP_MS: u8 = 51;
+    /// rd, rsize: allocate a fixed-size zero-filled kernel blob, result = id.
+    /// With BUF_WRITE/BUF_READ this is the mutable-fixed-blob primitive
+    /// (BEAM's atomics/ETS niche): off-heap, GC-immune, stable physical
+    /// address — the thing framebuffers and DMA backings are made of.
+    pub const BUF_NEW: u8 = 52;
+    /// rd, rbuf, roff, rlen: copy a bounds-checked slice of a blob out as a
+    /// fresh binary term.
+    pub const BUF_READ: u8 = 53;
 }
 
 #[derive(Debug, Clone)]

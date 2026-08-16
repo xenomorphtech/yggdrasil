@@ -18,6 +18,11 @@ use alloc::vec::Vec;
 use ygg_bytecode::{Module, op};
 use ygg_term::{Heap, HeapFull, Term};
 
+/// Reserved word (tag 0b111, never a valid term) returned by an engine when
+/// the function ended in `TAIL_CALL_EXT`; the invoking trampoline picks the
+/// stashed target up via `SystemApi::take` semantics and re-dispatches.
+pub const TAIL_SENTINEL: Term = Term(7);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trap {
     /// Type error, bad index, arity mismatch, bad register…
@@ -59,6 +64,58 @@ pub trait SystemApi {
     fn buf_to_bin(&mut self, id: i64) -> Result<Term, Trap>;
     /// Create a kernel packet buffer from a binary; returns its id as an int term.
     fn bin_to_buf(&mut self, bin: Term) -> Result<Term, Trap>;
+    /// Try to grow the process heap (segmented, non-moving). False at quota.
+    fn heap_grow(&mut self) -> bool {
+        false
+    }
+    /// Stash a tail-call target (global atoms); the engine then returns
+    /// `TAIL_SENTINEL` and the trampoline re-dispatches.
+    fn tail_call(&mut self, _module_atom: u32, _fname_atom: u32, _args: &[Term]) {}
+    /// Stash a *local* tail-call target (function index in the module instance
+    /// currently running); same sentinel/trampoline contract as `tail_call`.
+    fn tail_call_local(&mut self, _fn_idx: u32, _args: &[Term]) {}
+    /// Overwrite bytes of an existing kernel buffer at an offset. Result 0.
+    fn buf_write(&mut self, _buf: Term, _off: Term, _bin: Term) -> Result<Term, Trap> {
+        Err(Trap::Badarg)
+    }
+    /// Allocate a fixed-size zero-filled kernel blob; result = its id.
+    fn buf_new(&mut self, _size: Term) -> Result<Term, Trap> {
+        Err(Trap::Badarg)
+    }
+    /// Copy a slice of a kernel blob out as a fresh binary term.
+    fn buf_read(&mut self, _buf: Term, _off: Term, _len: Term) -> Result<Term, Trap> {
+        Err(Trap::Badarg)
+    }
+    /// Park the process for `ms` without consuming a mailbox message.
+    fn sleep_ms(&mut self, _ms: u64) {}
+    /// All-register submit (`PORT_SUBMIT2`): dynamic op/tag plus `arg1`.
+    fn port_submit2(
+        &mut self,
+        _port: Term,
+        _op: Term,
+        _arg0: Term,
+        _arg1: Term,
+        _tag: Term,
+    ) -> Result<(), Trap> {
+        Err(Trap::Badarg)
+    }
+}
+
+/// Allocate with grow-on-full retry; `Trap::HeapFull` only at the quota cap.
+fn alloc_term(
+    api: &mut dyn SystemApi,
+    f: impl Fn(&mut Heap) -> Result<Term, HeapFull>,
+) -> Result<Term, Trap> {
+    loop {
+        match f(api.heap()) {
+            Ok(t) => return Ok(t),
+            Err(HeapFull) => {
+                if !api.heap_grow() {
+                    return Err(Trap::HeapFull);
+                }
+            }
+        }
+    }
 }
 
 struct Frame<'m> {
@@ -156,7 +213,7 @@ pub fn run_function(
                     let r = fr.u8()?;
                     elems.push(fr.get(r)?);
                 }
-                let t = api.heap().tuple(&elems)?;
+                let t = alloc_term(api, |h| h.tuple(&elems))?;
                 fr.set(rd, t)?;
             }
             op::GET_ELEM => {
@@ -177,7 +234,7 @@ pub fn run_function(
                 let rh = fr.u8()?;
                 let rt = fr.u8()?;
                 let (h, t) = (fr.get(rh)?, fr.get(rt)?);
-                let c = api.heap().cons(h, t)?;
+                let c = alloc_term(api, |heap| heap.cons(h, t))?;
                 fr.set(rd, c)?;
             }
             op::HEAD | op::TAIL => {
@@ -248,6 +305,10 @@ pub fn run_function(
                 }
                 api.safepoint();
                 let v = run_function(m, callee, &args, api)?;
+                if v == TAIL_SENTINEL {
+                    // Callee tail-called out: unwind to the trampoline.
+                    return Ok(TAIL_SENTINEL);
+                }
                 fr.set(rd, v)?;
             }
             op::RET => {
@@ -302,6 +363,77 @@ pub fn run_function(
                 let (port, arg0, tag) = (fr.get(rp)?, fr.get(ra)?, fr.get(rt)?);
                 api.port_submit(port, o, arg0, tag)?;
             }
+            op::BUF_WRITE => {
+                let rd = fr.u8()?;
+                let rb = fr.u8()?;
+                let ro = fr.u8()?;
+                let rs = fr.u8()?;
+                let (buf, off, bin) = (fr.get(rb)?, fr.get(ro)?, fr.get(rs)?);
+                let v = api.buf_write(buf, off, bin)?;
+                fr.set(rd, v)?;
+            }
+            op::SLEEP_MS => {
+                let rm = fr.u8()?;
+                let ms = fr.get(rm)?.as_int().ok_or(Trap::Badarg)?;
+                if ms < 0 {
+                    return Err(Trap::Badarg);
+                }
+                api.safepoint();
+                api.sleep_ms(ms as u64);
+            }
+            op::BUF_NEW => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let size = fr.get(rs)?;
+                let v = api.buf_new(size)?;
+                fr.set(rd, v)?;
+            }
+            op::BUF_READ => {
+                let rd = fr.u8()?;
+                let rb = fr.u8()?;
+                let ro = fr.u8()?;
+                let rl = fr.u8()?;
+                let (buf, off, len) = (fr.get(rb)?, fr.get(ro)?, fr.get(rl)?);
+                let v = api.buf_read(buf, off, len)?;
+                fr.set(rd, v)?;
+            }
+            op::PORT_SUBMIT2 => {
+                let rp = fr.u8()?;
+                let ro = fr.u8()?;
+                let ra0 = fr.u8()?;
+                let ra1 = fr.u8()?;
+                let rt = fr.u8()?;
+                let (port, o, a0, a1, tag) =
+                    (fr.get(rp)?, fr.get(ro)?, fr.get(ra0)?, fr.get(ra1)?, fr.get(rt)?);
+                api.port_submit2(port, o, a0, a1, tag)?;
+            }
+            op::TAIL_CALL => {
+                let callee = fr.u32()?;
+                let n = fr.u8()? as usize;
+                let mut args = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let r = fr.u8()?;
+                    args.push(fr.get(r)?);
+                }
+                api.safepoint();
+                api.tail_call_local(callee, &args);
+                return Ok(TAIL_SENTINEL);
+            }
+            op::TAIL_CALL_EXT => {
+                let mlocal = fr.u32()?;
+                let flocal = fr.u32()?;
+                let n = fr.u8()? as usize;
+                let mut args = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let r = fr.u8()?;
+                    args.push(fr.get(r)?);
+                }
+                let mg = api.atom_global(mlocal);
+                let fg = api.atom_global(flocal);
+                api.safepoint();
+                api.tail_call(mg, fg, &args);
+                return Ok(TAIL_SENTINEL);
+            }
             op::CALL_EXT => {
                 let rd = fr.u8()?;
                 let mlocal = fr.u32()?;
@@ -341,7 +473,7 @@ pub fn run_function(
                     return Err(Trap::Badarg);
                 }
                 let v = if opcode == op::BSL { a.wrapping_shl(b as u32) } else { a >> b };
-                fr.set(rd, Term::int(((v << 3) >> 3)))?; // clamp into i61
+                fr.set(rd, Term::int((v << 3) >> 3))?; // clamp into i61
             }
             op::BNOT => {
                 let rd = fr.u8()?;
@@ -353,7 +485,7 @@ pub fn run_function(
                 let rd = fr.u8()?;
                 let len = fr.u32()? as usize;
                 let bytes = fr.bytes(len)?;
-                let b = api.heap().binary(bytes)?;
+                let b = alloc_term(api, |h| h.binary(bytes))?;
                 fr.set(rd, b)?;
             }
             op::BIN_FROM_LIST => {
@@ -374,7 +506,7 @@ pub fn run_function(
                 if !cur.is_nil() {
                     return Err(Trap::Badarg);
                 }
-                let b = api.heap().binary(&bytes)?;
+                let b = alloc_term(api, |h| h.binary(&bytes))?;
                 fr.set(rd, b)?;
             }
             op::BIN_TO_LIST => {
@@ -387,7 +519,7 @@ pub fn run_function(
                     }
                     t.bin_bytes().iter().map(|&b| Term::int(b as i64)).collect()
                 };
-                let l = api.heap().list(&elems)?;
+                let l = alloc_term(api, |h| h.list(&elems))?;
                 fr.set(rd, l)?;
             }
             op::BIN_SIZE => {
@@ -440,7 +572,7 @@ pub fn run_function(
                     v.extend_from_slice(b.bin_bytes());
                     v
                 };
-                let out = api.heap().binary(&joined)?;
+                let out = alloc_term(api, |h| h.binary(&joined))?;
                 fr.set(rd, out)?;
             }
             op::LIST_CAT => {
@@ -459,10 +591,13 @@ pub fn run_function(
                 if !cur.is_nil() {
                     return Err(Trap::Badarg);
                 }
-                let mut out = b;
-                for e in elems.into_iter().rev() {
-                    out = api.heap().cons(e, out)?;
-                }
+                let out = alloc_term(api, |h| {
+                    let mut out = b;
+                    for e in elems.iter().rev() {
+                        out = h.cons(*e, out)?;
+                    }
+                    Ok(out)
+                })?;
                 fr.set(rd, out)?;
             }
             op::BIN_PART => {
@@ -484,7 +619,7 @@ pub fn run_function(
                     }
                     bytes[off..off + len].to_vec()
                 };
-                let out = api.heap().binary(&part)?;
+                let out = alloc_term(api, |h| h.binary(&part))?;
                 fr.set(rd, out)?;
             }
             op::MAP_NEW => {
@@ -496,7 +631,17 @@ pub fn run_function(
                     let rv = fr.u8()?;
                     pairs.push((fr.get(rk)?, fr.get(rv)?));
                 }
-                let m = api.heap().map_from_pairs(&mut pairs).map_err(map_err)?;
+                let m = loop {
+                    match api.heap().map_from_pairs(&mut pairs) {
+                        Ok(m) => break m,
+                        Err(ygg_term::MapError::NonImmediateKey) => return Err(Trap::Badarg),
+                        Err(ygg_term::MapError::Heap(_)) => {
+                            if !api.heap_grow() {
+                                return Err(Trap::HeapFull);
+                            }
+                        }
+                    }
+                };
                 fr.set(rd, m)?;
             }
             op::MAP_GET => {
@@ -524,19 +669,22 @@ pub fn run_function(
                     if !m.is_boxed() || m.kind() != ygg_term::Kind::Map {
                         return Err(Trap::Badarg);
                     }
-                    let out = api.heap().map_put(m, k, v).map_err(map_err)?;
+                    let out = loop {
+                        match api.heap().map_put(m, k, v) {
+                            Ok(o) => break o,
+                            Err(ygg_term::MapError::NonImmediateKey) => return Err(Trap::Badarg),
+                            Err(ygg_term::MapError::Heap(_)) => {
+                                if !api.heap_grow() {
+                                    return Err(Trap::HeapFull);
+                                }
+                            }
+                        }
+                    };
                     fr.set(rd, out)?;
                 }
             }
             _ => return Err(Trap::BadCode),
         }
-    }
-}
-
-fn map_err(e: ygg_term::MapError) -> Trap {
-    match e {
-        ygg_term::MapError::Heap(_) => Trap::HeapFull,
-        ygg_term::MapError::NonImmediateKey => Trap::Badarg,
     }
 }
 

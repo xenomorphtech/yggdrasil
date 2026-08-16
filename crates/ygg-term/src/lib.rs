@@ -404,6 +404,94 @@ pub unsafe fn copy_term(src: Term, dst: &mut Heap) -> Result<Term, HeapFull> {
     }
 }
 
+/// Box-kind 7 marks a forwarded (evacuated) object: the header word holds the
+/// new location's term word with the low bits set to 7.
+const KIND_FWD: u64 = 7;
+
+/// Cheney evacuation: deep-copy everything reachable from `roots` into `to`,
+/// updating the roots in place. Unlike `copy_term`, **sharing is preserved**:
+/// each object is copied once and its old header becomes a forwarding pointer,
+/// so diamonds don't duplicate and heap use can only shrink or stay equal.
+///
+/// This is the compaction step of the per-process GC (run at trampoline safe
+/// points, where the roots are the complete live set).
+///
+/// # Safety
+/// - All boxed parts of `roots` must point into live from-space memory.
+/// - `to` must be a *different* heap from every from-space span.
+/// - From-space is consumed: headers are overwritten with forwarding words.
+pub unsafe fn evacuate(roots: &mut [Term], to: &mut Heap) -> Result<(), HeapFull> {
+    unsafe {
+        let scan_start = to.top;
+        for r in roots.iter_mut() {
+            *r = evac_one(*r, to)?;
+        }
+        // Breadth-first scan of newly copied objects.
+        let mut scan = scan_start;
+        while scan < to.top {
+            let header = *to.base.add(scan);
+            match header & TAG_MASK {
+                KIND_TUPLE => {
+                    let n = (header >> 3) as usize;
+                    for i in 0..n {
+                        let p = to.base.add(scan + 1 + i);
+                        *p = evac_one(Term(*p), to)?.0;
+                    }
+                    scan += 1 + n;
+                }
+                KIND_CONS => {
+                    for i in 1..=2 {
+                        let p = to.base.add(scan + i);
+                        *p = evac_one(Term(*p), to)?.0;
+                    }
+                    scan += 3;
+                }
+                KIND_BINARY => {
+                    let len = (header >> 3) as usize;
+                    scan += 1 + len.div_ceil(8);
+                }
+                KIND_MAP => {
+                    let n = (header >> 3) as usize;
+                    // Keys are immediates; only values need evacuation.
+                    for i in 0..n {
+                        let p = to.base.add(scan + 1 + n + i);
+                        *p = evac_one(Term(*p), to)?.0;
+                    }
+                    scan += 1 + 2 * n;
+                }
+                k => unreachable!("bad box kind {k} during scan"),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Shallow-copy one object into `to` (or chase its forwarding pointer).
+unsafe fn evac_one(t: Term, to: &mut Heap) -> Result<Term, HeapFull> {
+    if !t.is_boxed() {
+        return Ok(t);
+    }
+    unsafe {
+        let old = t.0 as *mut u64;
+        let header = *old;
+        if header & TAG_MASK == KIND_FWD {
+            return Ok(Term(header & !TAG_MASK));
+        }
+        let words = match header & TAG_MASK {
+            KIND_TUPLE => 1 + (header >> 3) as usize,
+            KIND_CONS => 3,
+            KIND_BINARY => 1 + ((header >> 3) as usize).div_ceil(8),
+            KIND_MAP => 1 + 2 * (header >> 3) as usize,
+            k => unreachable!("bad box kind {k}"),
+        };
+        let dst = to.alloc(words)?;
+        core::ptr::copy_nonoverlapping(old, dst, words);
+        let new = Term(dst as u64);
+        *old = new.0 | KIND_FWD;
+        Ok(new)
+    }
+}
+
 /// Heap words needed to deep-copy `t` (matches `copy_term`'s allocations).
 /// List spines are walked iteratively, mirroring `copy_term`.
 ///
@@ -612,6 +700,63 @@ mod tests {
         unsafe {
             assert!(eq(c, l));
         }
+    }
+
+    #[test]
+    fn evacuate_preserves_sharing_and_structure() {
+        let (mut b1, mut b2) = (Vec::new(), Vec::new());
+        let mut from = heap(&mut b1);
+        let mut to = heap(&mut b2);
+
+        let shared = from.tuple(&[Term::int(1), Term::int(2)]).unwrap();
+        let bin = from.binary(b"gc!").unwrap();
+        let mut pairs = [(Term::atom(1), shared), (Term::atom(2), bin)];
+        let m = from.map_from_pairs(&mut pairs).unwrap();
+        // Diamond: the same tuple reachable twice + via the map.
+        let root = from.tuple(&[shared, shared, m]).unwrap();
+        let lst = from.list(&[root, Term::int(9)]).unwrap();
+
+        let mut roots = [lst];
+        unsafe { evacuate(&mut roots, &mut to) }.unwrap();
+        let lst2 = roots[0];
+        unsafe {
+            assert_ne!(lst2.0, lst.0);
+            let root2 = lst2.head();
+            // Sharing preserved: both slots point at ONE copy.
+            assert_eq!(root2.tuple_elem(0).0, root2.tuple_elem(1).0);
+            let m2 = root2.tuple_elem(2);
+            assert_eq!(m2.map_get(Term::atom(1)).unwrap().0, root2.tuple_elem(0).0);
+            assert_eq!(m2.map_get(Term::atom(2)).unwrap().bin_bytes(), b"gc!");
+            assert_eq!(root2.tuple_elem(0).tuple_elem(1).as_int(), Some(2));
+            assert_eq!(lst2.tail().head().as_int(), Some(9));
+        }
+        // Compaction bound: to-space is no larger than a naive shared copy.
+        // shared tuple(3) + bin(2) + map(5) + root tuple(4) + 2 cons(6) = 20 words.
+        assert_eq!(to.used_bytes(), 20 * 8);
+    }
+
+    #[test]
+    fn evacuate_deep_list_iteratively_scans() {
+        let mut b1 = vec![0u64; 400_000];
+        let mut b2 = vec![0u64; 400_000];
+        let mut from = unsafe { Heap::new(b1.as_mut_ptr().cast(), b1.len() * 8) };
+        let mut to = unsafe { Heap::new(b2.as_mut_ptr().cast(), b2.len() * 8) };
+        let mut l = Term::NIL;
+        for i in 0..100_000 {
+            l = from.cons(Term::int(i), l).unwrap();
+        }
+        let mut roots = [l];
+        unsafe { evacuate(&mut roots, &mut to) }.unwrap();
+        let mut cur = roots[0];
+        let mut n = 0i64;
+        unsafe {
+            while cur.kind() == Kind::Cons {
+                assert_eq!(cur.head().as_int(), Some(99_999 - n));
+                cur = cur.tail();
+                n += 1;
+            }
+        }
+        assert_eq!(n, 100_000);
     }
 
     #[test]

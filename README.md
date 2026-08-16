@@ -16,6 +16,7 @@ BEAM where it's proven, modernized where technology moved on:
 | **SMP** | Limine MP bring-up, per-CPU run queues with work stealing, wake IPIs, TLB-shootdown IPIs for stack recycling, panic halts all cores. |
 | **Ports** | Every device is an SQ/CQ ring pair owned by a process (the shape virtio/NVMe/io_uring converged on). Completions arrive as ordinary messages. Serial (IRQ-driven), virtio-blk, virtio-net. |
 | **Code** | Custom register bytecode, load-time **verifier** (the security boundary), two-version **hot code loading** with `call_ext` migration and `purge`. |
+| **GC + tail calls** | `TAIL_CALL`/`TAIL_CALL_EXT` unwind to an engine trampoline (constant native stack); each outermost hop is an exact GC point where the stashed args are the whole live set — Cheney compaction with forwarding pointers preserves sharing. Heaps grow segmented (non-moving) up to quota between collections. |
 | **Execution** | Tier 0: interpreter. Tier 1: **Cranelift JIT compiled in-kernel** (no_std cranelift 0.134), published into an RX code zone with hand-rolled relocation patching. Differentially tested against the interpreter. |
 
 ## Layout
@@ -43,6 +44,7 @@ Requires: nightly Rust (pinned via `rust-toolchain.toml`), `qemu-system-x86_64`,
 ```sh
 cargo xtask run    # boot in QEMU q35, serial on stdio
 cargo xtask test   # full acceptance suite: two boots + pcap assertion
+cargo xtask watch  # boot the Lux gpu driver on a visible display (GTK)
 cargo test         # host tests for all pure crates
 ```
 
@@ -70,16 +72,58 @@ uses below 33 keys), `LIST_CAT`, and the packet-buffer bridge
 under either engine (`--jit` mmaps and runs the Cranelift output in userspace)
 for fast differential debugging.
 
+## Devices from Lux: ports as the whole driver surface
+
+Lux programs reach hardware through the raw port surface — `ygg::port_open`,
+`ygg::port_submit` (`PORT_SUBMIT2`: all-register, exposes both SQE args),
+`ygg::buf_to_bin`/`bin_to_buf` — with completions arriving as ordinary
+`{port_reply, Port, Tag, Result}` messages. Alongside it sit **mutable
+fixed-size kernel blobs** (`ygg::buf_new`/`buf_write`/`buf_read`) — the niche
+BEAM fills with atomics/ETS: off-heap, GC-immune, stable physical address.
+A framebuffer is just a blob the device is also attached to, so a driver
+animates by writing rows in place. `receive { after N => … }` lowers to a
+timer-wheel sleep for frame pacing. The suite proves it all:
+
+- `port_hello.lux` owns the serial port and writes `LUX-PORT-OK` byte-by-byte.
+- `gpu_demo.lux` is a **complete virtio-gpu 2D display driver in Lux**: it
+  encodes every control command itself (display info, `RESOURCE_CREATE_2D`,
+  `ATTACH_BACKING`, `SET_SCANOUT`, `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`),
+  renders a scene into a framebuffer binary, and pushes it all through the
+  kernel's **gpu transport port** (`KIND_GPU`). The kernel owns the control
+  virtqueue but never interprets a command: `OP_CTRL` ships an opaque buffer
+  and returns the response buffer; `OP_CTRL_ATTACH` is the single
+  protocol-shaped assist — it appends the `{phys, len}` mem-entry for a pinned
+  backing buffer, because guest physical addresses must never be visible to
+  bytecode. The harness screendumps QEMU headlessly and asserts the rendered
+  pixels — then the driver **animates**: a paced tail-recursive frame loop
+  (`buf_write` band → transfer → flush → sleep) whose final frame is
+  screendump-verified too. `cargo xtask watch` shows it live in a GTK window.
+  (`cargo xtask spike` runs the equivalent native fill — useful to isolate
+  transport bugs from driver bugs.)
+
+**What this unlocks (virgl):** a 3D/virgl driver is *the same surface*. virgl's
+`CTX_CREATE`, capset queries, resource creation, and `SUBMIT_3D` command
+streams are all just control-queue commands — `OP_CTRL` buffers a Lux program
+can encode today, with backing stores attached via `OP_CTRL_ATTACH`. The two
+known ceilings: QEMU must run with `-device virtio-gpu-gl` (and a GL-capable
+display) for the device to accept 3D contexts, and completions are currently
+synchronous/poll-based through the port pump — fence-driven async completion
+is a later upgrade, not an architectural change.
+
 ## Status
 
-Milestones M0–M10 complete (boot → memory → processes → full semantics →
+Milestones M0–M11 complete (boot → memory → processes → full semantics →
 bytecode/interpreter → ports → virtio → verifier → hot loading → Cranelift
-JIT → Lux TCP/IP stack → **SMP**). The suite runs on 4 cores: Limine MP
-bring-up, per-CPU state behind a `gs:[0]` accessor (run queues, preempt flags,
-scheduler contexts, TSS/IST), BEAM-style heap *fragments* so no core ever
-writes another core's process heap, work stealing with wake IPIs, TLB
-shootdown for stack-slot recycling, and tests that only pass with true
-parallelism (an unpreemptible spinner released by concurrently-running code).
-Known deferrals: per-process GC (heaps are fixed-quota bump arenas;
-`copy_term` is the seed of the future semispace collector), floats, arrays as
-a first-class term kind.
+JIT → Lux TCP/IP stack → **SMP** → **GC + tail calls + Lux device drivers**).
+The suite runs on 4 cores: Limine MP bring-up, per-CPU state behind a `gs:[0]`
+accessor (run queues, preempt flags, scheduler contexts, TSS/IST), BEAM-style
+heap *fragments* so no core ever writes another core's process heap, work
+stealing with wake IPIs, TLB shootdown for stack-slot recycling, and tests
+that only pass with true parallelism. M11's acceptance: 100k tail-recursive
+Lux iterations in bounded memory, and the Lux gpu driver's scene verified
+pixel-by-pixel from a headless screendump.
+
+Known limits/deferrals: compaction runs only at *outermost* trampoline hops
+(nested calls and native drivers hold live terms the collector cannot see, so
+they only grow — BEAM-style anywhere-GC needs stack maps); floats; arrays as
+a first-class term kind; fence/interrupt-driven gpu completion.

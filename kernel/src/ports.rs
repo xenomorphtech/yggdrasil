@@ -24,6 +24,7 @@ use crate::proc::{self, Pid};
 pub const KIND_SERIAL: u8 = 0;
 pub const KIND_BLK: u8 = 1;
 pub const KIND_NET: u8 = 2;
+pub const KIND_GPU: u8 = 3;
 
 /// Common ops. Serial: WRITE arg0 = byte, READ completes with a byte.
 /// Blk: WRITE/READ arg0 = sector, arg1 = buffer id (READ allocates its own,
@@ -32,6 +33,13 @@ pub const KIND_NET: u8 = 2;
 pub const OP_WRITE: u32 = 1;
 pub const OP_READ: u32 = 2;
 pub const OP_FLUSH: u32 = 3;
+/// Gpu: CTRL arg0 = command buffer id (consumed), arg1 = response capacity
+/// hint; result = response buffer id. CTRL_ATTACH arg0 = command-prefix
+/// buffer id (an ATTACH_BACKING header with nr_entries=1), arg1 = backing
+/// buffer id: the kernel appends the one `{phys, len}` mem entry — guest
+/// physical addresses never reach bytecode — and pins the backing buffer.
+pub const OP_CTRL: u32 = 1;
+pub const OP_CTRL_ATTACH: u32 = 2;
 
 pub struct Port {
     pub owner: Pid,
@@ -55,6 +63,7 @@ pub fn open(kind: u8) -> Option<Term> {
         KIND_SERIAL => {}
         KIND_BLK if crate::virtio::has_blk() => {}
         KIND_NET if crate::virtio::has_net() => {}
+        KIND_GPU if crate::virtio::has_gpu() => {}
         _ => return None,
     }
     let id = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
@@ -84,6 +93,7 @@ pub fn submit(port_id: u64, sqe: Sqe) -> bool {
         KIND_SERIAL => serial_drain_sq(p),
         KIND_BLK => blk_drain_sq(p),
         KIND_NET => net_drain_sq(p),
+        KIND_GPU => gpu_drain_sq(p),
         _ => unreachable!(),
     }
     drop(ports);
@@ -181,10 +191,46 @@ fn net_drain_sq(p: &mut Port) {
     }
 }
 
+/// virtio-gpu raw transport: synchronous, command bytes are opaque.
+fn gpu_drain_sq(p: &mut Port) {
+    while let Some(sqe) = p.sq.pop() {
+        let result: i64 = match sqe.op {
+            OP_CTRL => match buf_take(sqe.arg0) {
+                Some(cmd) => match crate::virtio::gpu_ctrl(&cmd, sqe.arg1 as usize) {
+                    Ok(resp) => buf_create(resp) as i64,
+                    Err(()) => -1,
+                },
+                None => -2,
+            },
+            OP_CTRL_ATTACH => match (buf_take(sqe.arg0), buf_pin(sqe.arg1)) {
+                (Some(mut cmd), Some((phys, len))) => {
+                    // struct virtio_gpu_mem_entry { le64 addr; le32 length; le32 pad }
+                    cmd.extend_from_slice(&phys.to_le_bytes());
+                    cmd.extend_from_slice(&(len as u32).to_le_bytes());
+                    cmd.extend_from_slice(&0u32.to_le_bytes());
+                    match crate::virtio::gpu_ctrl(&cmd, 24) {
+                        Ok(resp) => buf_create(resp) as i64,
+                        Err(()) => -1,
+                    }
+                }
+                _ => -2,
+            },
+            _ => -1,
+        };
+        if sqe.tag != SKIP_CQE {
+            let _ = p.cq.push(Cqe { tag: sqe.tag, result });
+        }
+    }
+}
+
 // ---- buffer table: opaque data handles crossing the port boundary ----
 
 static BUFFERS: Mutex<BTreeMap<u64, alloc::vec::Vec<u8>>> = Mutex::new(BTreeMap::new());
 static NEXT_BUF: AtomicU64 = AtomicU64::new(1);
+/// Buffers attached as device backing stores: the device holds their guest
+/// physical address, so `buf_take` must never move them out. They live until
+/// the kernel shuts the resource down (for now: forever — a demo-scale leak).
+static PINNED: Mutex<alloc::collections::BTreeSet<u64>> = Mutex::new(alloc::collections::BTreeSet::new());
 
 pub fn buf_create(data: alloc::vec::Vec<u8>) -> u64 {
     let id = NEXT_BUF.fetch_add(1, Ordering::Relaxed);
@@ -193,7 +239,52 @@ pub fn buf_create(data: alloc::vec::Vec<u8>) -> u64 {
 }
 
 pub fn buf_take(id: u64) -> Option<alloc::vec::Vec<u8>> {
+    if PINNED.lock().contains(&id) {
+        return None;
+    }
     BUFFERS.lock().remove(&id)
+}
+
+/// Overwrite part of an existing buffer in place. Never grows it — a pinned
+/// backing buffer's physical address must stay valid — so out-of-bounds
+/// writes are refused rather than extended.
+pub fn buf_write(id: u64, offset: usize, data: &[u8]) -> bool {
+    let mut bufs = BUFFERS.lock();
+    let Some(buf) = bufs.get_mut(&id) else {
+        return false;
+    };
+    let Some(end) = offset.checked_add(data.len()) else {
+        return false;
+    };
+    if end > buf.len() {
+        return false;
+    }
+    buf[offset..end].copy_from_slice(data);
+    true
+}
+
+/// Copy a bounds-checked slice of a buffer out.
+pub fn buf_read(id: u64, offset: usize, len: usize) -> Option<alloc::vec::Vec<u8>> {
+    let bufs = BUFFERS.lock();
+    let buf = bufs.get(&id)?;
+    let end = offset.checked_add(len)?;
+    if end > buf.len() {
+        return None;
+    }
+    Some(buf[offset..end].to_vec())
+}
+
+/// Pin a buffer as a device backing store and return its physical address and
+/// length. The kernel heap is physically contiguous, so one mem entry covers
+/// the whole buffer.
+fn buf_pin(id: u64) -> Option<(u64, usize)> {
+    let bufs = BUFFERS.lock();
+    let data = bufs.get(&id)?;
+    let phys = crate::mm::virt_to_phys(data.as_ptr() as u64);
+    let len = data.len();
+    drop(bufs);
+    PINNED.lock().insert(id);
+    Some((phys, len))
 }
 
 pub fn buf_get(id: u64) -> Option<alloc::vec::Vec<u8>> {

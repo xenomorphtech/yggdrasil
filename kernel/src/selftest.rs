@@ -45,6 +45,9 @@ pub extern "C" fn proc_tests(_arg: u64) {
     hot_code_loading();
     differential_engines();
     lux_tcp_stack();
+    lux_bounded_loop();
+    lux_port_hello();
+    lux_gpu_demo();
     lux_tcp_echo_live();
     bytecode();
     serial_port_echo();
@@ -731,6 +734,16 @@ fn lux_call(name: &str, args: &[Term]) -> Term {
         .unwrap_or_else(|t| panic!("lux {name} trapped: {t:?}"))
 }
 
+/// `lux_call` with trampoline-hop compaction. Only for callers holding no
+/// process-heap terms across the call (immediate args, no live boxed state).
+fn lux_call_gc(name: &str, args: &[Term]) -> Term {
+    let hash = LUX_ALIASES.lock().get(name).cloned().unwrap_or_else(|| panic!("no lux fn {name}"));
+    let module = crate::modload::current(&hash).expect("lux module missing");
+    let fn_idx = module.module.function_named("apply").expect("no apply");
+    crate::modload::invoke_gc(&module, fn_idx, args)
+        .unwrap_or_else(|t| panic!("lux {name} trapped: {t:?}"))
+}
+
 /// `LUXPK1\n [u32 entry_len][entry][u32 count] count*([u32 nlen][name][u32 dlen][data])`
 /// then `[u32 alias_count] count*([u32 len][source_name][u32 len][hash])`.
 fn load_luxpack(bytes: &[u8]) -> Option<alloc::string::String> {
@@ -766,6 +779,156 @@ fn load_luxpack(bytes: &[u8]) -> Option<alloc::string::String> {
         aliases.insert(name, hash);
     }
     Some(entry)
+}
+
+// ---- M11: tail calls + trampoline GC ----
+
+/// 100k tail-recursive Lux iterations, each allocating garbage, inside the
+/// *default* 256 KiB quota — impossible without both the trampoline (native
+/// stack would overflow) and compaction (heap would cap out in ~700 rounds).
+fn lux_bounded_loop() {
+    let me = proc::current();
+    proc::spawn_with_heap(lux_loop_runner, Term::pid(me).0, 64);
+    let msg = proc::recv_timeout(120_000).expect("lux loop never finished");
+    assert_eq!(msg, atoms::atom("lux_loop_ok"));
+    println!("[ok] lux loop: 100k tail-recursive iterations in bounded memory");
+}
+
+extern "C" fn lux_loop_runner(parent_raw: u64) {
+    let parent = Term(parent_raw).as_pid().unwrap();
+    let r = lux_call_gc("loop_test", &[Term::int(100_000)]);
+    // sum(1..=100000)
+    assert_eq!(r.as_int(), Some(5_000_050_000), "loop result wrong");
+    proc::send(parent, atoms::atom("lux_loop_ok"));
+}
+
+/// A Lux program owns the serial port and writes `LUX-PORT-OK` through
+/// `PORT_SUBMIT2` — the whole Lux→port path with zero kernel driver code.
+fn lux_port_hello() {
+    let me = proc::current();
+    proc::spawn_with_heap(lux_port_runner, Term::pid(me).0, 64);
+    let msg = proc::recv_timeout(30_000).expect("lux port hello never finished");
+    assert_eq!(msg, atoms::atom("lux_port_ok"));
+    println!("[ok] lux port: serial written via PORT_SUBMIT2");
+}
+
+extern "C" fn lux_port_runner(parent_raw: u64) {
+    let parent = Term(parent_raw).as_pid().unwrap();
+    let r = lux_call("hello", &[]);
+    assert_eq!(r, atoms::atom("true"), "port hello returned false");
+    proc::send(parent, atoms::atom("lux_port_ok"));
+}
+
+/// A 2D display driver written entirely in Lux: it encodes every virtio-gpu
+/// control command itself and pushes them through the raw transport port.
+/// The harness screendumps the scanout and asserts the scene's pixels.
+fn lux_gpu_demo() {
+    let me = proc::current();
+    proc::spawn_with_heap(lux_gpu_runner, Term::pid(me).0, 4096);
+    let msg = proc::recv_timeout(120_000).expect("lux gpu demo never finished");
+    assert_eq!(msg, atoms::atom("lux_gpu_ok"));
+    println!("[ok] lux gpu: scene rendered via virtio-gpu");
+    let msg = proc::recv_timeout(120_000).expect("lux gpu animation never finished");
+    assert_eq!(msg, atoms::atom("lux_gpu_anim_ok"));
+    println!("[ok] lux gpu: animation played via buf_write");
+}
+
+extern "C" fn lux_gpu_runner(parent_raw: u64) {
+    let parent = Term(parent_raw).as_pid().unwrap();
+    let r = lux_call_gc("drive", &[]);
+    assert_eq!(r, atoms::atom("true"), "gpu drive returned false");
+    proc::send(parent, atoms::atom("lux_gpu_ok"));
+    // Give the harness time to screendump the static scene before the
+    // animation replaces the scanout (it dumps within ~1s of the marker).
+    let _ = proc::recv_timeout(5_000);
+    let r = lux_call_gc("animate", &[Term::int(60)]);
+    assert_eq!(r, atoms::atom("true"), "gpu animate returned false");
+    proc::send(parent, atoms::atom("lux_gpu_anim_ok"));
+}
+
+/// `gpudemo` cmdline (see `cargo xtask watch`): run the Lux driver on a
+/// visible display — the static scene, then the bouncing band, indefinitely.
+pub extern "C" fn gpu_visual(_arg: u64) {
+    let pack = crate::modload::boot_module_bytes("tcp_ip.luxpack").expect("no luxpack");
+    load_luxpack(pack).expect("bad luxpack");
+    assert_eq!(lux_call_gc("drive", &[]), atoms::atom("true"), "gpu drive failed");
+    println!("[gpu] static scene up; animation starts in 2s");
+    let _ = proc::recv_timeout(2_000);
+    let _ = lux_call_gc("animate", &[Term::int(1_000_000)]);
+}
+
+// ---- M11 C1 spike: native fill through the gpu transport port ----
+// Throwaway validation that (a) the raw control-queue transport works and
+// (b) headless `screendump` sees the scanout. Boot with `gpuspike`.
+
+pub extern "C" fn gpu_spike(_arg: u64) {
+    let port = crate::ports::open(crate::ports::KIND_GPU).expect("no gpu port");
+    let pid = port.as_port().unwrap();
+    let hdr = |ty: u32| -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::with_capacity(24);
+        v.extend_from_slice(&ty.to_le_bytes());
+        v.extend_from_slice(&[0u8; 20]); // flags, fence, ctx, ring+pad
+        v
+    };
+    let rect = |v: &mut alloc::vec::Vec<u8>| {
+        for x in [0u32, 0, 320, 200] {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+    };
+    let submit = |op: u32, cmd: alloc::vec::Vec<u8>, arg1: u64| -> alloc::vec::Vec<u8> {
+        let id = crate::ports::buf_create(cmd);
+        let sqe = ygg_rings::Sqe { op, tag: 7, arg0: id, arg1 };
+        assert!(crate::ports::submit(pid, sqe), "gpu submit failed");
+        let msg = proc::recv_timeout(5_000).expect("no gpu reply");
+        let result = unsafe { msg.tuple_elem(3) }.as_int().expect("bad reply");
+        assert!(result > 0, "gpu ctrl error: {result}");
+        crate::ports::buf_take(result as u64).expect("resp buffer gone")
+    };
+    let ok = |resp: &[u8]| u32::from_le_bytes(resp[0..4].try_into().unwrap());
+
+    // RESOURCE_CREATE_2D: id 1, format B8G8R8X8 (2), 320x200.
+    let mut c = hdr(0x101);
+    for x in [1u32, 2, 320, 200] {
+        c.extend_from_slice(&x.to_le_bytes());
+    }
+    assert_eq!(ok(&submit(crate::ports::OP_CTRL, c, 24)), 0x1100);
+
+    // Backing store: solid red XRGB (bytes B,G,R,X little-endian).
+    let mut fb = alloc::vec::Vec::with_capacity(320 * 200 * 4);
+    for _ in 0..320 * 200 {
+        fb.extend_from_slice(&[0u8, 0, 255, 0]);
+    }
+    let backing = crate::ports::buf_create(fb);
+
+    // ATTACH_BACKING: kernel appends the {phys, len} entry.
+    let mut c = hdr(0x106);
+    c.extend_from_slice(&1u32.to_le_bytes()); // resource id
+    c.extend_from_slice(&1u32.to_le_bytes()); // nr_entries
+    assert_eq!(ok(&submit(crate::ports::OP_CTRL_ATTACH, c, backing)), 0x1100);
+
+    // SET_SCANOUT 0 -> resource 1.
+    let mut c = hdr(0x103);
+    rect(&mut c);
+    c.extend_from_slice(&0u32.to_le_bytes());
+    c.extend_from_slice(&1u32.to_le_bytes());
+    assert_eq!(ok(&submit(crate::ports::OP_CTRL, c, 24)), 0x1100);
+
+    // TRANSFER_TO_HOST_2D + FLUSH.
+    let mut c = hdr(0x105);
+    rect(&mut c);
+    c.extend_from_slice(&0u64.to_le_bytes());
+    c.extend_from_slice(&1u32.to_le_bytes());
+    c.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(ok(&submit(crate::ports::OP_CTRL, c, 24)), 0x1100);
+    let mut c = hdr(0x104);
+    rect(&mut c);
+    c.extend_from_slice(&1u32.to_le_bytes());
+    c.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(ok(&submit(crate::ports::OP_CTRL, c, 24)), 0x1100);
+
+    println!("[ok] gpu spike: scene flushed");
+    // Stay alive so the harness can screendump.
+    let _ = proc::recv_timeout(600_000);
 }
 
 // ---- M10 phase B: the Lux stack serving a real host TCP connection ----

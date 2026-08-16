@@ -247,6 +247,28 @@ fn verify_fn(m: &Module, fn_idx: usize, f: &Function) -> Result<(), VerifyError>
                 reg_ok(s.u8()?, at)?;
                 reg_ok(s.u8()?, at)?;
             }
+            op::PORT_SUBMIT2 => {
+                for _ in 0..5 {
+                    reg_ok(s.u8()?, at)?;
+                }
+            }
+            op::BUF_WRITE => {
+                for _ in 0..4 {
+                    reg_ok(s.u8()?, at)?;
+                }
+            }
+            op::SLEEP_MS => {
+                reg_ok(s.u8()?, at)?;
+            }
+            op::BUF_NEW => {
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+            }
+            op::BUF_READ => {
+                for _ in 0..4 {
+                    reg_ok(s.u8()?, at)?;
+                }
+            }
             op::CALL_EXT => {
                 reg_ok(s.u8()?, at)?;
                 for _ in 0..2 {
@@ -264,6 +286,37 @@ fn verify_fn(m: &Module, fn_idx: usize, f: &Function) -> Result<(), VerifyError>
                 for _ in 0..nargs {
                     reg_ok(s.u8()?, at)?;
                 }
+            }
+            op::TAIL_CALL => {
+                let callee = s.u32()?;
+                let nargs = s.u8()?;
+                let Some(target) = m.functions.get(callee as usize) else {
+                    return Err(VerifyError::BadCallTarget { fn_idx, at, callee });
+                };
+                if target.arity != nargs {
+                    return Err(VerifyError::BadCallArity { fn_idx, at });
+                }
+                for _ in 0..nargs {
+                    reg_ok(s.u8()?, at)?;
+                }
+                fell_through = false;
+            }
+            op::TAIL_CALL_EXT => {
+                for _ in 0..2 {
+                    let a = s.u32()?;
+                    if m.atoms.get(a as usize).is_none() {
+                        return Err(VerifyError::BadAtom {
+                            fn_idx,
+                            at,
+                            atom: a,
+                        });
+                    }
+                }
+                let nargs = s.u8()?;
+                for _ in 0..nargs {
+                    reg_ok(s.u8()?, at)?;
+                }
+                fell_through = false;
             }
             op::BAND | op::BOR | op::BXOR | op::BSL | op::BSR => {
                 reg_ok(s.u8()?, at)?;

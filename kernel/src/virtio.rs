@@ -9,8 +9,10 @@ use core::ptr::NonNull;
 
 use spin::Mutex;
 use virtio_drivers::device::blk::{SECTOR_SIZE, VirtIOBlk};
+use virtio_drivers::device::common::Feature;
 use virtio_drivers::device::net::VirtIONet;
-use virtio_drivers::transport::DeviceType;
+use virtio_drivers::queue::VirtQueue;
+use virtio_drivers::transport::{DeviceType, Transport};
 use virtio_drivers::transport::pci::bus::{Cam, Command, MmioCam, PciRoot};
 use virtio_drivers::transport::pci::{PciTransport, virtio_device_type};
 use virtio_drivers::{BufferDirection, Hal, PhysAddr as VPhysAddr};
@@ -25,6 +27,16 @@ type Net = VirtIONet<KernelHal, PciTransport, NET_QUEUE_SIZE>;
 
 static BLK: Mutex<Option<Blk>> = Mutex::new(None);
 static NET: Mutex<Option<Net>> = Mutex::new(None);
+
+/// virtio-gpu as a raw *transport*: the kernel owns the control virtqueue but
+/// never interprets the commands flowing through it — the GPU protocol
+/// (virtio-gpu 2D today, virgl command streams tomorrow) lives in bytecode.
+pub struct Gpu {
+    transport: PciTransport,
+    ctrl: VirtQueue<KernelHal, 64>,
+}
+
+static GPU: Mutex<Option<Gpu>> = Mutex::new(None);
 
 pub struct KernelHal;
 
@@ -85,6 +97,17 @@ pub fn init() {
                 log::info!("virtio: net at {df}, mac {:02x?}", net.mac_address());
                 *NET.lock() = Some(net);
             }
+            DeviceType::GPU => {
+                let mut t =
+                    PciTransport::new::<KernelHal, _>(&mut root, df).expect("virtio-gpu transport");
+                let features = t.begin_init(Feature::VERSION_1);
+                let ctrl = VirtQueue::<KernelHal, 64>::new(&mut t, 0, false, false)
+                    .expect("virtio-gpu ctrl queue");
+                // Cursor queue (1) intentionally left unpopulated.
+                t.finish_init();
+                log::info!("virtio: gpu at {df} (features {features:?})");
+                *GPU.lock() = Some(Gpu { transport: t, ctrl });
+            }
             other => log::info!("virtio: ignoring {other:?} at {df}"),
         }
     }
@@ -96,6 +119,25 @@ pub fn has_blk() -> bool {
 
 pub fn has_net() -> bool {
     NET.lock().is_some()
+}
+
+pub fn has_gpu() -> bool {
+    GPU.lock().is_some()
+}
+
+/// Submit one opaque command to the gpu control queue and wait for the
+/// device's response (synchronous, like blk). `resp_len` is the caller's
+/// capacity hint; every virtio-gpu response starts with a 24-byte ctrl header.
+pub fn gpu_ctrl(cmd: &[u8], resp_len: usize) -> Result<alloc::vec::Vec<u8>, ()> {
+    let mut guard = GPU.lock();
+    let g = guard.as_mut().ok_or(())?;
+    let mut resp = alloc::vec![0u8; resp_len.clamp(24, 1 << 20)];
+    let n = g
+        .ctrl
+        .add_notify_wait_pop(&[cmd], &mut [&mut resp[..]], &mut g.transport)
+        .map_err(|_| ())?;
+    resp.truncate(n as usize);
+    Ok(resp)
 }
 
 pub fn blk_read(sector: u64) -> Result<alloc::vec::Vec<u8>, ()> {

@@ -39,6 +39,12 @@ struct Loaded {
     atom_map: Vec<u32>,
 }
 
+/// A stashed tail-call target (mirrors kernel `proc::TailTarget`).
+enum HostTail {
+    Ext(u32, u32, Vec<Term>),
+    Local(u32, Vec<Term>),
+}
+
 struct World {
     atoms: Atoms,
     modules: HashMap<String, Rc<Loaded>>,
@@ -48,6 +54,7 @@ struct World {
     buffers: HashMap<i64, Vec<u8>>,
     next_buf: i64,
     call_depth: usize,
+    tail_target: Option<HostTail>,
 }
 
 struct HostApi {
@@ -89,6 +96,16 @@ impl SystemApi for HostApi {
     fn port_submit(&mut self, _p: Term, _o: u8, _a: Term, _t: Term) -> Result<(), Trap> {
         Err(Trap::Badarg)
     }
+    fn tail_call(&mut self, module_atom: u32, fname_atom: u32, args: &[Term]) {
+        self.world.borrow_mut().tail_target =
+            Some(HostTail::Ext(module_atom, fname_atom, args.to_vec()));
+    }
+    fn tail_call_local(&mut self, fn_idx: u32, args: &[Term]) {
+        self.world.borrow_mut().tail_target = Some(HostTail::Local(fn_idx, args.to_vec()));
+    }
+    fn sleep_ms(&mut self, ms: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     fn call_ext(&mut self, module_atom: u32, fname_atom: u32, args: &[Term]) -> Result<Term, Trap> {
         let (mname, fname, target, depth) = {
             let mut w = self.world.borrow_mut();
@@ -106,8 +123,7 @@ impl SystemApi for HostApi {
             eprintln!("TRAP: no function {mname}:{fname}");
             return Err(Trap::Badarg);
         };
-        let mut api = HostApi { world: self.world.clone(), module: target.clone() };
-        let r = ygg_interp::run_function(&target.module, fn_idx, args, &mut api);
+        let r = trampoline(&self.world, target, fn_idx, args.to_vec());
         self.world.borrow_mut().call_depth -= 1;
         if let Err(t) = &r {
             eprintln!("TRAP {t:?} in {mname}:{fname}/{} (depth {depth})", args.len());
@@ -118,6 +134,50 @@ impl SystemApi for HostApi {
         let data =
             self.world.borrow_mut().buffers.remove(&id).ok_or(Trap::Badarg)?;
         self.heap().binary(&data).map_err(|_| Trap::HeapFull)
+    }
+    fn buf_new(&mut self, size: Term) -> Result<Term, Trap> {
+        let size = size.as_int().ok_or(Trap::Badarg)?;
+        if size < 0 || size > 64 << 20 {
+            return Err(Trap::Badarg);
+        }
+        let mut w = self.world.borrow_mut();
+        let id = w.next_buf;
+        w.next_buf += 1;
+        w.buffers.insert(id, vec![0u8; size as usize]);
+        Ok(Term::int(id))
+    }
+    fn buf_read(&mut self, buf: Term, off: Term, len: Term) -> Result<Term, Trap> {
+        let id = buf.as_int().ok_or(Trap::Badarg)?;
+        let off = off.as_int().ok_or(Trap::Badarg)? as usize;
+        let len = len.as_int().ok_or(Trap::Badarg)? as usize;
+        let data = {
+            let w = self.world.borrow();
+            let data = w.buffers.get(&id).ok_or(Trap::Badarg)?;
+            let end = off.checked_add(len).ok_or(Trap::Badarg)?;
+            if end > data.len() {
+                return Err(Trap::Badarg);
+            }
+            data[off..end].to_vec()
+        };
+        self.heap().binary(&data).map_err(|_| Trap::HeapFull)
+    }
+    fn buf_write(&mut self, buf: Term, off: Term, bin: Term) -> Result<Term, Trap> {
+        let id = buf.as_int().ok_or(Trap::Badarg)?;
+        let off = off.as_int().ok_or(Trap::Badarg)? as usize;
+        let bytes = unsafe {
+            if !bin.is_boxed() || bin.kind() != ygg_term::Kind::Binary {
+                return Err(Trap::Badarg);
+            }
+            bin.bin_bytes().to_vec()
+        };
+        let mut w = self.world.borrow_mut();
+        let data = w.buffers.get_mut(&id).ok_or(Trap::Badarg)?;
+        let end = off.checked_add(bytes.len()).ok_or(Trap::Badarg)?;
+        if end > data.len() {
+            return Err(Trap::Badarg);
+        }
+        data[off..end].copy_from_slice(&bytes);
+        Ok(Term::int(0))
     }
     fn bin_to_buf(&mut self, bin: Term) -> Result<Term, Trap> {
         let bytes = unsafe {
@@ -138,6 +198,40 @@ fn leak(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }
 
+/// Run with TAIL_CALL_EXT trampolining (constant Rust stack per tail chain).
+fn trampoline(
+    world: &Rc<RefCell<World>>,
+    mut target: Rc<Loaded>,
+    mut fn_idx: usize,
+    mut args: Vec<Term>,
+) -> Result<Term, Trap> {
+    loop {
+        let mut api = HostApi { world: world.clone(), module: target.clone() };
+        let r = ygg_interp::run_function(&target.module, fn_idx, &args, &mut api)?;
+        if r != ygg_interp::TAIL_SENTINEL {
+            return Ok(r);
+        }
+        let stashed = world.borrow_mut().tail_target.take().ok_or(Trap::BadCode)?;
+        match stashed {
+            HostTail::Ext(ma, fa, targs) => {
+                let (mname, fname) = {
+                    let w = world.borrow();
+                    (w.atoms.name(ma).to_string(), w.atoms.name(fa).to_string())
+                };
+                let next = world.borrow().modules.get(&mname).cloned().ok_or(Trap::Badarg)?;
+                let idx = next.module.function_named(&fname).ok_or(Trap::Badarg)?;
+                target = next;
+                fn_idx = idx;
+                args = targs;
+            }
+            HostTail::Local(idx, targs) => {
+                fn_idx = idx as usize;
+                args = targs;
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
     let use_jit = if let Some(i) = args.iter().position(|a| a == "--jit") {
@@ -149,8 +243,11 @@ fn main() -> Result<()> {
     let path = args.get(1).context("usage: ygg-run [--jit] <pack.luxpack> [entry] [fn]")?;
     let bytes = std::fs::read(path)?;
 
+    let int_args: Vec<Term> =
+        args.iter().skip(4).filter_map(|a| a.parse::<i64>().ok().map(Term::int)).collect();
+
     if use_jit {
-        return run_jit(&bytes, args.get(2).cloned(), args.get(3).cloned());
+        return run_jit(&bytes, args.get(2).cloned(), args.get(3).cloned(), int_args);
     }
 
     let mut heap_buf = vec![0u64; 32 * 1024 * 1024]; // 256 MiB host heap
@@ -163,6 +260,7 @@ fn main() -> Result<()> {
         buffers: HashMap::new(),
         next_buf: 1,
         call_depth: 0,
+        tail_target: None,
     }));
 
     // Parse luxpack.
@@ -201,8 +299,7 @@ fn main() -> Result<()> {
         .module
         .function_named(&fname)
         .with_context(|| format!("no {fname} in entry"))?;
-    let mut api = HostApi { world: world.clone(), module: target.clone() };
-    match ygg_interp::run_function(&target.module, fn_idx, &[], &mut api) {
+    match trampoline(&world, target.clone(), fn_idx, int_args) {
         Ok(t) => {
             let mut s = String::new();
             let w = world.borrow();
@@ -217,7 +314,12 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_jit(bytes: &[u8], entry_override: Option<String>, fname: Option<String>) -> Result<()> {
+fn run_jit(
+    bytes: &[u8],
+    entry_override: Option<String>,
+    fname: Option<String>,
+    int_args: Vec<Term>,
+) -> Result<()> {
     let mut at = 0usize;
     let take = |at: &mut usize, n: usize| -> Result<&[u8]> {
         let s = bytes.get(*at..*at + n).context("truncated pack")?;
@@ -242,6 +344,7 @@ fn run_jit(bytes: &[u8], entry_override: Option<String>, fname: Option<String>) 
         heap,
         heap_buf,
         stack: Vec::new(),
+        tail_target: None,
     });
     for _ in 0..count {
         let nlen = u32at(&mut at)?;
@@ -258,7 +361,7 @@ fn run_jit(bytes: &[u8], entry_override: Option<String>, fname: Option<String>) 
     }
     let entry = entry_override.unwrap_or(entry);
     let fname = fname.unwrap_or_else(|| "apply".to_string());
-    let result = jit_host::run(world, &entry, &fname);
+    let result = jit_host::run(world, &entry, &fname, int_args);
     // NOTE: the world was leaked into the static; fine for a CLI run.
     println!("jit result raw: {:#x}", result.0);
     match jit_host::atom_index("true") {
@@ -295,6 +398,7 @@ mod jit_host {
         pub heap: Heap,
         pub heap_buf: Vec<u64>,
         pub stack: Vec<String>,
+        pub tail_target: Option<super::HostTail>,
     }
 
     static mut W: *mut JWorld = std::ptr::null_mut();
@@ -392,13 +496,40 @@ mod jit_host {
     }
 
 
-    pub fn run(world: Box<JWorld>, entry: &str, fname: &str) -> Term {
+    const SENTINEL: u64 = 7;
+
+    pub fn run(world: Box<JWorld>, entry: &str, fname: &str, args: Vec<Term>) -> Term {
         unsafe { W = Box::into_raw(world) };
         let m = w().modules.get(entry).unwrap_or_else(|| die("entry module missing"));
         let fn_idx = m.module.function_named(fname).unwrap_or_else(|| die("no entry fn"));
-        let addr = m.fn_addrs[fn_idx];
         w().stack.push(format!("{entry}:{fname}"));
-        invoke(addr, &[])
+        trampoline(m, fn_idx, args)
+    }
+
+    fn trampoline(mut m: &'static JMod, mut fn_idx: usize, mut args: Vec<Term>) -> Term {
+        loop {
+            let r = invoke(m.fn_addrs[fn_idx], &args);
+            if r.0 != SENTINEL {
+                return r;
+            }
+            match w().tail_target.take().unwrap_or_else(|| die("sentinel without stash")) {
+                super::HostTail::Ext(ma, fa, targs) => {
+                    let mname = w().atoms.name(ma).to_string();
+                    let fname = w().atoms.name(fa).to_string();
+                    let next =
+                        w().modules.get(&mname).unwrap_or_else(|| die("tail: unknown module"));
+                    let idx =
+                        next.module.function_named(&fname).unwrap_or_else(|| die("tail: no fn"));
+                    m = next;
+                    fn_idx = idx;
+                    args = targs;
+                }
+                super::HostTail::Local(idx, targs) => {
+                    fn_idx = idx as usize;
+                    args = targs;
+                }
+            }
+        }
     }
 
     fn heap() -> &'static mut Heap {
@@ -470,6 +601,23 @@ mod jit_host {
     extern "C" fn h_port_submit(_p: u64, _o: u64, _a: u64, _t: u64) -> u64 {
         die("port_submit on host")
     }
+    extern "C" fn h_port_submit2(_p: u64, _o: u64, _a0: u64, _a1: u64, _t: u64) -> u64 {
+        die("port_submit2 on host")
+    }
+    extern "C" fn h_buf_write(_b: u64, _o: u64, _s: u64) -> u64 {
+        die("buf_write on host")
+    }
+    extern "C" fn h_buf_new(_s: u64) -> u64 {
+        die("buf_new on host")
+    }
+    extern "C" fn h_buf_read(_b: u64, _o: u64, _l: u64) -> u64 {
+        die("buf_read on host")
+    }
+    extern "C" fn h_sleep_ms(ms: u64) {
+        if let Some(ms) = Term(ms).as_int() {
+            std::thread::sleep(std::time::Duration::from_millis(ms.max(0) as u64));
+        }
+    }
     extern "C" fn h_call_ext(ma: u64, fa: u64, ptr: *const Term, n: u64) -> u64 {
         let args = unsafe { std::slice::from_raw_parts(ptr, n as usize) }.to_vec();
         let mname = w().atoms.name(Term(ma).as_atom().unwrap_or(u32::MAX)).to_string();
@@ -483,9 +631,8 @@ mod jit_host {
         if m.module.functions[fn_idx].arity as usize != args.len() {
             die(&format!("arity mismatch {mname}:{fname}"));
         }
-        let addr = m.fn_addrs[fn_idx];
         w().stack.push(format!("{mname}:{fname}/{}", args.len()));
-        let r = invoke(addr, &args);
+        let r = trampoline(m, fn_idx, args);
         w().stack.pop();
         r.0
     }
@@ -495,6 +642,17 @@ mod jit_host {
     }
     extern "C" fn h_trap_badarg() -> u64 {
         die("badarg (inline tag check)")
+    }
+    extern "C" fn h_tail_call_ext(ma: u64, fa: u64, ptr: *const Term, n: u64) {
+        let args = unsafe { std::slice::from_raw_parts(ptr, n as usize) }.to_vec();
+        let (Some(ma), Some(fa)) = (Term(ma).as_atom(), Term(fa).as_atom()) else {
+            die("tail_call_ext: bad atoms")
+        };
+        w().tail_target = Some(super::HostTail::Ext(ma, fa, args));
+    }
+    extern "C" fn h_tail_call_local(fn_idx: u64, ptr: *const Term, n: u64) {
+        let args = unsafe { std::slice::from_raw_parts(ptr, n as usize) }.to_vec();
+        w().tail_target = Some(super::HostTail::Local(fn_idx as u32, args));
     }
     extern "C" fn h_bin_const(ptr: *const u8, len: u64) -> u64 {
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
@@ -663,6 +821,13 @@ mod jit_host {
         t[Helper::BinCat as usize] = h_bin_cat as usize as u64;
         t[Helper::ListCat as usize] = h_list_cat as usize as u64;
         t[Helper::BinPart as usize] = h_bin_part as usize as u64;
+        t[Helper::TailCallExt as usize] = h_tail_call_ext as usize as u64;
+        t[Helper::TailCallLocal as usize] = h_tail_call_local as usize as u64;
+        t[Helper::PortSubmit2 as usize] = h_port_submit2 as usize as u64;
+        t[Helper::BufWrite as usize] = h_buf_write as usize as u64;
+        t[Helper::SleepMs as usize] = h_sleep_ms as usize as u64;
+        t[Helper::BufNew as usize] = h_buf_new as usize as u64;
+        t[Helper::BufRead as usize] = h_buf_read as usize as u64;
         t
     }
 }

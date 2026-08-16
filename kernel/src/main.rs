@@ -65,6 +65,11 @@ extern "C" fn kmain() -> ! {
     if has_arg("selftest") {
         selftest::early();
         proc::spawn(selftest::proc_tests, 0);
+    } else if has_arg("gpuspike") {
+        proc::spawn(selftest::gpu_spike, 0);
+    } else if has_arg("gpudemo") {
+        // The Lux driver builds whole-frame binaries; give it a real heap.
+        proc::spawn_with_heap(selftest::gpu_visual, 0, 4096);
     } else if has_arg("verify-disk") {
         proc::spawn(selftest::verify_disk, 0);
     } else {

@@ -36,7 +36,17 @@ fn main() -> Result<()> {
         "test" => {
             test(&root)?;
         }
-        _ => bail!("usage: cargo xtask <build|iso|run|test>"),
+        "spike" => {
+            gpu_spike(&root)?;
+        }
+        "watch" => {
+            // Boot the Lux gpu driver on a visible display: static scene,
+            // then the bouncing band, until the window is closed.
+            let iso = make_iso(&root, "gpudemo")?;
+            let status = qemu_command(&root, &iso, false, "gtk")?.status()?;
+            println!("qemu exited: {status}");
+        }
+        _ => bail!("usage: cargo xtask <build|iso|run|test|watch|spike>"),
     }
     Ok(())
 }
@@ -132,45 +142,50 @@ fn build_modules(root: &Path) -> Result<Vec<PathBuf>> {
 /// `LUXPK1\n [u32 entry_len][entry][u32 count] count*([u32 nlen][name][u32 dlen][data])`.
 fn build_luxpack(root: &Path) -> Result<PathBuf> {
     let lux_root = root.parent().unwrap().join("lux");
-    let status = Command::new("cargo")
-        .args(["run", "-q", "--", "--yggdrasil", "examples/tcp_ip.lux"])
-        .current_dir(&lux_root)
-        .status()
-        .context("running the lux compiler (needs ../lux checkout)")?;
-    ensure!(status.success(), "lux --yggdrasil failed");
-
+    const EXAMPLES: &[&str] = &["tcp_ip", "lux_loop", "port_hello", "gpu_demo"];
     let artifacts = lux_root.join("target/lux/artifacts");
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(artifacts.join("tcp_ip.ygg.json"))?)?;
-    let entry = manifest["entry"]["module"]
-        .as_str()
-        .context("manifest has no entry module")?;
-    let modules = manifest["modules"].as_array().context("manifest has no modules")?;
+    let mut entry = String::new();
+    let mut module_list: Vec<(String, String)> = Vec::new(); // (name, file)
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    for stem in EXAMPLES {
+        let status = Command::new("cargo")
+            .args(["run", "-q", "--", "--yggdrasil", &format!("examples/{stem}.lux")])
+            .current_dir(&lux_root)
+            .status()
+            .context("running the lux compiler (needs ../lux checkout)")?;
+        ensure!(status.success(), "lux --yggdrasil failed for {stem}");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(artifacts.join(format!("{stem}.ygg.json")))?)?;
+        if *stem == "tcp_ip" {
+            entry = manifest["entry"]["module"]
+                .as_str()
+                .context("manifest has no entry module")?
+                .to_string();
+        }
+        for m in manifest["modules"].as_array().context("manifest has no modules")? {
+            let name = m["name"].as_str().context("module without name")?;
+            let file = m["file"].as_str().context("module without file")?;
+            if !module_list.iter().any(|(n, _)| n == name) {
+                module_list.push((name.to_string(), file.to_string()));
+            }
+        }
+        for f in manifest["aliases"].as_array().context("manifest has no aliases")? {
+            if let (Some(name), Some(module)) = (f["name"].as_str(), f["module"].as_str()) {
+                aliases.push((name.to_string(), module.to_string()));
+            }
+        }
+    }
 
     let mut pack: Vec<u8> = b"LUXPK1\n".to_vec();
     pack.extend_from_slice(&(entry.len() as u32).to_le_bytes());
     pack.extend_from_slice(entry.as_bytes());
-    pack.extend_from_slice(&(modules.len() as u32).to_le_bytes());
-    for m in modules {
-        let name = m["name"].as_str().context("module without name")?;
-        let file = m["file"].as_str().context("module without file")?;
+    pack.extend_from_slice(&(module_list.len() as u32).to_le_bytes());
+    for (name, file) in &module_list {
         let data = std::fs::read(artifacts.join(file))?;
         pack.extend_from_slice(&(name.len() as u32).to_le_bytes());
         pack.extend_from_slice(name.as_bytes());
         pack.extend_from_slice(&(data.len() as u32).to_le_bytes());
         pack.extend_from_slice(&data);
-    }
-    // Alias table (appended; older readers ignore trailing bytes):
-    // u32 count, count * (u32 len, source_name, u32 len, module_hash).
-    // Lets the kernel resolve entry points like `input`/`tcp_send` by name.
-    let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(artifacts.join("tcp_ip.meta.json"))?)?;
-    let functions = meta["functions"].as_array().context("meta has no functions")?;
-    let mut aliases: Vec<(String, String)> = Vec::new();
-    for f in functions {
-        if let (Some(name), Some(module)) = (f["source_name"].as_str(), f["module"].as_str()) {
-            aliases.push((name.to_string(), module.to_string()));
-        }
     }
     pack.extend_from_slice(&(aliases.len() as u32).to_le_bytes());
     for (name, module) in &aliases {
@@ -183,7 +198,7 @@ fn build_luxpack(root: &Path) -> Result<PathBuf> {
     let out = root.join("build/tcp_ip.luxpack");
     std::fs::create_dir_all(out.parent().unwrap())?;
     std::fs::write(&out, pack)?;
-    println!("luxpack: {} modules, {} aliases, entry {entry}", modules.len(), aliases.len());
+    println!("luxpack: {} modules, {} aliases, entry {entry}", module_list.len(), aliases.len());
     Ok(out)
 }
 
@@ -293,7 +308,7 @@ fn embed_hotmod(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn qemu_command(root: &Path, iso: &Path, capture: bool) -> Result<Command> {
+fn qemu_command(root: &Path, iso: &Path, capture: bool, display: &str) -> Result<Command> {
     let disk = ensure_disk(root)?;
     let pcap = root.join("build/net.pcap");
     let mut cmd = Command::new("qemu-system-x86_64");
@@ -309,7 +324,7 @@ fn qemu_command(root: &Path, iso: &Path, capture: bool) -> Result<Command> {
         "-cdrom",
         iso.to_str().unwrap(),
         "-display",
-        "none",
+        display,
         "-device",
         "isa-debug-exit,iobase=0xf4,iosize=0x04",
         "-no-reboot",
@@ -325,6 +340,15 @@ fn qemu_command(root: &Path, iso: &Path, capture: bool) -> Result<Command> {
         "virtio-net-pci,netdev=n0",
         "-object",
         &format!("filter-dump,id=f0,netdev=n0,file={}", pcap.display()),
+        "-vga",
+        "none",
+        "-device",
+        "virtio-gpu-pci",
+        "-monitor",
+        &format!(
+            "unix:{},server,nowait",
+            root.join("build/mon.sock").display()
+        ),
     ]);
     if capture {
         cmd.stdout(Stdio::piped()).stdin(Stdio::piped());
@@ -333,9 +357,101 @@ fn qemu_command(root: &Path, iso: &Path, capture: bool) -> Result<Command> {
 }
 
 fn run_qemu(root: &Path, iso: &Path) -> Result<()> {
-    let status = qemu_command(root, iso, false)?.status()?;
+    let status = qemu_command(root, iso, false, "none")?.status()?;
     // isa-debug-exit makes any exit code nonzero; don't treat that as failure here.
     println!("qemu exited: {status}");
+    Ok(())
+}
+
+/// Issue `screendump` over the QEMU monitor socket and parse the P6 PPM.
+/// Returns (width, height, rgb bytes).
+fn monitor_screendump(root: &Path) -> Result<(usize, usize, Vec<u8>)> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let ppm = root.join("build/gpu.ppm");
+    let _ = std::fs::remove_file(&ppm);
+    let mut sock = UnixStream::connect(root.join("build/mon.sock"))
+        .context("connecting to qemu monitor socket")?;
+    sock.write_all(format!("screendump {}\n", ppm.display()).as_bytes())?;
+    sock.flush()?;
+    // Drain the monitor greeting/echo until the file shows up.
+    sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut sink = [0u8; 1024];
+    while std::time::Instant::now() < deadline {
+        let _ = sock.read(&mut sink);
+        if ppm.exists() && std::fs::metadata(&ppm)?.len() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200)); // let it finish
+            break;
+        }
+    }
+    let data = std::fs::read(&ppm).context("reading screendump ppm")?;
+    ensure!(data.starts_with(b"P6"), "screendump is not a P6 ppm");
+    // P6\n<width> <height>\n<maxval>\n<binary rgb>
+    let mut fields = Vec::new();
+    let mut at = 2usize;
+    while fields.len() < 3 {
+        while at < data.len() && data[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while at < data.len() && !data[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        fields.push(std::str::from_utf8(&data[start..at])?.parse::<usize>()?);
+    }
+    at += 1; // the single whitespace after maxval
+    let (w, h) = (fields[0], fields[1]);
+    ensure!(data.len() >= at + w * h * 3, "ppm truncated");
+    Ok((w, h, data[at..at + w * h * 3].to_vec()))
+}
+
+/// C1 spike: boot the native gpu fill and verify headless screendump works.
+fn gpu_spike(root: &Path) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    let iso = make_iso(root, "gpuspike")?;
+    let mut child =
+        qemu_command(root, &iso, true, "none")?.spawn().context("spawning qemu")?;
+    let mut stdout = child.stdout.take().unwrap();
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let captured = captured.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => captured.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+        });
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        ensure!(std::time::Instant::now() < deadline, "gpu spike marker never appeared");
+        let text = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        if text.contains("[ok] gpu spike: scene flushed") {
+            break;
+        }
+        if text.contains("KERNEL PANIC") {
+            let _ = child.kill();
+            bail!("kernel panicked:\n{text}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let dump = monitor_screendump(root);
+    let _ = child.kill();
+    let (w, h, rgb) = dump?;
+    println!("screendump: {w}x{h}");
+    let px = |x: usize, y: usize| -> (u8, u8, u8) {
+        let i = (y * w + x) * 3;
+        (rgb[i], rgb[i + 1], rgb[i + 2])
+    };
+    println!("center pixel: {:?}", px(w / 2, h / 2));
+    ensure!(px(w / 2, h / 2) == (255, 0, 0), "expected solid red at center");
+    println!("gpu spike: PASS");
     Ok(())
 }
 
@@ -351,7 +467,7 @@ fn test(root: &Path) -> Result<()> {
     let iso = make_iso(root, "selftest")?;
     embed_hotmod(root)?;
 
-    let mut child = qemu_command(root, &iso, true)?
+    let mut child = qemu_command(root, &iso, true, "none")?
         .spawn()
         .context("spawning qemu")?;
     let mut stdout = child.stdout.take().unwrap();
@@ -375,6 +491,8 @@ fn test(root: &Path) -> Result<()> {
     //     and expect our bytes echoed back by the Lux stack;
     //  2. when the bytecode serial echo server says it's ready, type PING.
     let mut typed = false;
+    let mut gpu_dump: Option<Result<(usize, usize, Vec<u8>)>> = None;
+    let mut anim_dump: Option<Result<(usize, usize, Vec<u8>)>> = None;
     let mut tcp_thread: Option<std::thread::JoinHandle<Result<()>>> = None;
     let start = Instant::now();
     let status = loop {
@@ -384,6 +502,16 @@ fn test(root: &Path) -> Result<()> {
         {
             let snapshot = captured.lock().unwrap().clone();
             let text = String::from_utf8_lossy(&snapshot).into_owned();
+            // The Lux gpu driver leaves its scene on scanout 0; grab it over
+            // the monitor while the guest is still running.
+            if gpu_dump.is_none() && text.contains("[ok] lux gpu: scene rendered via virtio-gpu")
+            {
+                gpu_dump = Some(monitor_screendump(root));
+            }
+            if anim_dump.is_none() && text.contains("[ok] lux gpu: animation played via buf_write")
+            {
+                anim_dump = Some(monitor_screendump(root));
+            }
             if tcp_thread.is_none() && text.contains("[tcp] listening") {
                 tcp_thread = Some(std::thread::spawn(|| {
                     use std::io::{Read as _, Write as _};
@@ -459,6 +587,11 @@ fn test(root: &Path) -> Result<()> {
         "[ok] hot upgrade v1->v2: state retained, new format, purge killed the holdout",
         "[ok] differential: interpreter and Cranelift JIT agree on mathmod",
         "[ok] lux tcp/ip stack: full protocol suite passed on yggdrasil",
+        "[ok] lux loop: 100k tail-recursive iterations in bounded memory",
+        "LUX-PORT-OK",
+        "[ok] lux port: serial written via PORT_SUBMIT2",
+        "[ok] lux gpu: scene rendered via virtio-gpu",
+        "[ok] lux gpu: animation played via buf_write",
         "[ok] lux tcp stack served a real host connection (SYN->echo)",
         "[bc] 101",
         "[bc] 105",
@@ -471,6 +604,39 @@ fn test(root: &Path) -> Result<()> {
         ensure!(transcript.contains(marker), "missing marker: {marker:?}");
     }
 
+    // Assert the Lux-rendered scene pixel-by-pixel: three bands + the
+    // centered white rectangle (B8G8R8X8 written by the driver -> RGB here).
+    let (w, h, rgb) = gpu_dump
+        .context("gpu marker never appeared before qemu exit")?
+        .context("screendump failed")?;
+    ensure!((w, h) == (320, 200), "unexpected scanout {w}x{h}");
+    let px = |x: usize, y: usize| -> (u8, u8, u8) {
+        let i = (y * w + x) * 3;
+        (rgb[i], rgb[i + 1], rgb[i + 2])
+    };
+    ensure!(px(160, 33) == (255, 0, 0), "top band not red: {:?}", px(160, 33));
+    ensure!(px(160, 73) == (0, 255, 0), "middle band not green: {:?}", px(160, 73));
+    ensure!(px(160, 100) == (255, 255, 255), "center rect not white: {:?}", px(160, 100));
+    ensure!(px(10, 100) == (0, 255, 0), "rect margin not green: {:?}", px(10, 100));
+    ensure!(px(160, 166) == (0, 0, 255), "bottom band not blue: {:?}", px(160, 166));
+    println!("gpu screendump: scene verified at 5 probe points");
+
+    // The animation's last frame: 60 frames starting at y=0, +2/frame, no
+    // erase after the final draw -> white band rows 118..157 on the dark
+    // blue background (bytes b,g,r = 96,32,32 -> RGB 32,32,96).
+    let (w, h, rgb) = anim_dump
+        .context("animation marker never appeared before qemu exit")?
+        .context("animation screendump failed")?;
+    ensure!((w, h) == (320, 200), "unexpected animated scanout {w}x{h}");
+    let px = |x: usize, y: usize| -> (u8, u8, u8) {
+        let i = (y * w + x) * 3;
+        (rgb[i], rgb[i + 1], rgb[i + 2])
+    };
+    ensure!(px(160, 138) == (255, 255, 255), "band not at rest: {:?}", px(160, 138));
+    ensure!(px(160, 60) == (32, 32, 96), "background above band: {:?}", px(160, 60));
+    ensure!(px(160, 185) == (32, 32, 96), "background below band: {:?}", px(160, 185));
+    println!("gpu screendump: animation final frame verified");
+
     // The guest's UDP payload must have hit the wire. Check before phase 2,
     // which truncates the pcap when QEMU restarts.
     let pcap = std::fs::read(root.join("build/net.pcap")).context("reading net.pcap")?;
@@ -482,7 +648,7 @@ fn test(root: &Path) -> Result<()> {
 
     // Phase 2: reboot with `verify-disk` — the pattern must persist.
     let iso2 = make_iso(root, "verify-disk")?;
-    let out = qemu_command(root, &iso2, true)?
+    let out = qemu_command(root, &iso2, true, "none")?
         .stdin(Stdio::null())
         .output()
         .context("running verify-disk boot")?;

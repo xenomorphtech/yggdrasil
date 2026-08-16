@@ -74,8 +74,15 @@ pub enum Helper {
     BinCat = 27,     // (bin, bin) -> bin
     ListCat = 28,    // (list, term) -> list
     BinPart = 29,    // (bin, off, len) -> bin
+    TailCallExt = 30, // (module_atom, fname_atom, ptr, n) — stash only
+    TailCallLocal = 31, // (fn_idx, ptr, n) — stash only (same module instance)
+    PortSubmit2 = 32, // (port, op, arg0, arg1, tag) -> 0
+    BufWrite = 33,    // (buf id term, off term, bin) -> 0
+    SleepMs = 34,     // (ms term) — parks the process
+    BufNew = 35,      // (size term) -> blob id term
+    BufRead = 36,     // (buf id term, off term, len term) -> binary
 }
-pub const HELPER_COUNT: usize = 30;
+pub const HELPER_COUNT: usize = 37;
 
 fn helper_nargs(h: u32) -> usize {
     match h {
@@ -108,6 +115,13 @@ fn helper_nargs(h: u32) -> usize {
         x if x == Helper::BinCat as u32 => 2,
         x if x == Helper::ListCat as u32 => 2,
         x if x == Helper::BinPart as u32 => 3,
+        x if x == Helper::TailCallExt as u32 => 4,
+        x if x == Helper::TailCallLocal as u32 => 3,
+        x if x == Helper::PortSubmit2 as u32 => 5,
+        x if x == Helper::BufWrite as u32 => 3,
+        x if x == Helper::SleepMs as u32 => 1,
+        x if x == Helper::BufNew as u32 => 1,
+        x if x == Helper::BufRead as u32 => 3,
         _ => 0,
     }
 }
@@ -119,6 +133,9 @@ fn helper_has_ret(h: u32) -> bool {
             || x == Helper::Print as u32
             || x == Helper::ExitAtom as u32
             || x == Helper::TrapBadarg as u32
+            || x == Helper::TailCallExt as u32
+            || x == Helper::TailCallLocal as u32
+            || x == Helper::SleepMs as u32
     )
 }
 
@@ -350,6 +367,28 @@ fn find_leaders(code: &[u8]) -> Result<BTreeSet<usize>, JitError> {
                 d.u8()?;
                 d.u8()?;
             }
+            op::PORT_SUBMIT2 => {
+                for _ in 0..5 {
+                    d.u8()?;
+                }
+            }
+            op::BUF_WRITE => {
+                for _ in 0..4 {
+                    d.u8()?;
+                }
+            }
+            op::SLEEP_MS => {
+                d.u8()?;
+            }
+            op::BUF_NEW => {
+                d.u8()?;
+                d.u8()?;
+            }
+            op::BUF_READ => {
+                for _ in 0..4 {
+                    d.u8()?;
+                }
+            }
             op::CALL_EXT => {
                 d.u8()?;
                 d.u32()?;
@@ -358,6 +397,23 @@ fn find_leaders(code: &[u8]) -> Result<BTreeSet<usize>, JitError> {
                 for _ in 0..n {
                     d.u8()?;
                 }
+            }
+            op::TAIL_CALL_EXT => {
+                d.u32()?;
+                d.u32()?;
+                let n = d.u8()?;
+                for _ in 0..n {
+                    d.u8()?;
+                }
+                leaders.insert(d.pc);
+            }
+            op::TAIL_CALL => {
+                d.u32()?;
+                let n = d.u8()?;
+                for _ in 0..n {
+                    d.u8()?;
+                }
+                leaders.insert(d.pc);
             }
             _ => return Err(JitError::BadBytecode),
         }
@@ -703,6 +759,16 @@ fn compile_fn(
                     let fref = tx.sibling(callee);
                     let call = tx.b.ins().call(fref, &args);
                     let v = tx.b.inst_results(call)[0];
+                    // Sentinel propagation: a callee that tail-called out
+                    // unwinds this frame too.
+                    let is_tail = tx.b.ins().icmp_imm(IntCC::Equal, v, 7);
+                    let cont = tx.b.create_block();
+                    let unwind = tx.b.create_block();
+                    tx.b.ins().brif(is_tail, unwind, &[], cont, &[]);
+                    tx.b.switch_to_block(unwind);
+                    let sent = tx.b.ins().iconst(types::I64, 7);
+                    tx.b.ins().return_(&[sent]);
+                    tx.b.switch_to_block(cont);
                     tx.b.def_var(tx.regs[rd], v);
                 }
                 op::RET => {
@@ -762,6 +828,54 @@ fn compile_fn(
                     let tg = tx.b.use_var(tx.regs[rt]);
                     tx.call_helper(Helper::PortSubmit, &[p, ov, a0, tg]);
                 }
+                op::PORT_SUBMIT2 => {
+                    let rp = d.u8()? as usize;
+                    let ro = d.u8()? as usize;
+                    let ra0 = d.u8()? as usize;
+                    let ra1 = d.u8()? as usize;
+                    let rt = d.u8()? as usize;
+                    let p = tx.b.use_var(tx.regs[rp]);
+                    let o = tx.b.use_var(tx.regs[ro]);
+                    let a0 = tx.b.use_var(tx.regs[ra0]);
+                    let a1 = tx.b.use_var(tx.regs[ra1]);
+                    let tg = tx.b.use_var(tx.regs[rt]);
+                    tx.call_helper(Helper::PortSubmit2, &[p, o, a0, a1, tg]);
+                }
+                op::BUF_WRITE => {
+                    let rd = d.u8()? as usize;
+                    let rb = d.u8()? as usize;
+                    let ro = d.u8()? as usize;
+                    let rs = d.u8()? as usize;
+                    let b_ = tx.b.use_var(tx.regs[rb]);
+                    let o = tx.b.use_var(tx.regs[ro]);
+                    let s = tx.b.use_var(tx.regs[rs]);
+                    let v = tx.call_helper(Helper::BufWrite, &[b_, o, s]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::SLEEP_MS => {
+                    let rm = d.u8()? as usize;
+                    let m = tx.b.use_var(tx.regs[rm]);
+                    tx.call_helper(Helper::Safepoint, &[]);
+                    tx.call_helper(Helper::SleepMs, &[m]);
+                }
+                op::BUF_NEW => {
+                    let rd = d.u8()? as usize;
+                    let rs = d.u8()? as usize;
+                    let s = tx.b.use_var(tx.regs[rs]);
+                    let v = tx.call_helper(Helper::BufNew, &[s]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::BUF_READ => {
+                    let rd = d.u8()? as usize;
+                    let rb = d.u8()? as usize;
+                    let ro = d.u8()? as usize;
+                    let rl = d.u8()? as usize;
+                    let b_ = tx.b.use_var(tx.regs[rb]);
+                    let o = tx.b.use_var(tx.regs[ro]);
+                    let l = tx.b.use_var(tx.regs[rl]);
+                    let v = tx.call_helper(Helper::BufRead, &[b_, o, l]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
                 op::CALL_EXT => {
                     let rd = d.u8()? as usize;
                     let mlocal = d.u32()?;
@@ -779,6 +893,42 @@ fn compile_fn(
                     tx.call_helper(Helper::Safepoint, &[]);
                     let v = tx.call_helper(Helper::CallExt, &[ma, fa, ptr, nv]).unwrap();
                     tx.b.def_var(tx.regs[rd], v);
+                }
+                op::TAIL_CALL_EXT => {
+                    let mlocal = d.u32()?;
+                    let flocal = d.u32()?;
+                    let n = d.u8()? as usize;
+                    let mut args = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let r = d.u8()? as usize;
+                        args.push(tx.b.use_var(tx.regs[r]));
+                    }
+                    let ma = tx.atom_const(mlocal)?;
+                    let fa = tx.atom_const(flocal)?;
+                    let ptr = tx.spill(&args);
+                    let nv = tx.b.ins().iconst(types::I64, n as i64);
+                    tx.call_helper(Helper::Safepoint, &[]);
+                    tx.call_helper(Helper::TailCallExt, &[ma, fa, ptr, nv]);
+                    let sent = tx.b.ins().iconst(types::I64, 7);
+                    tx.b.ins().return_(&[sent]);
+                    filled = true;
+                }
+                op::TAIL_CALL => {
+                    let callee = d.u32()?;
+                    let n = d.u8()? as usize;
+                    let mut args = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let r = d.u8()? as usize;
+                        args.push(tx.b.use_var(tx.regs[r]));
+                    }
+                    let fi = tx.b.ins().iconst(types::I64, callee as i64);
+                    let ptr = tx.spill(&args);
+                    let nv = tx.b.ins().iconst(types::I64, n as i64);
+                    tx.call_helper(Helper::Safepoint, &[]);
+                    tx.call_helper(Helper::TailCallLocal, &[fi, ptr, nv]);
+                    let sent = tx.b.ins().iconst(types::I64, 7);
+                    tx.b.ins().return_(&[sent]);
+                    filled = true;
                 }
                 op::BAND | op::BOR | op::BXOR => {
                     let rd = d.u8()? as usize;
@@ -1088,9 +1238,46 @@ fn skip_insn(d: &mut Dec) -> Result<(), JitError> {
             d.u8()?;
             d.u8()?;
         }
+        op::PORT_SUBMIT2 => {
+            for _ in 0..5 {
+                d.u8()?;
+            }
+        }
+        op::BUF_WRITE => {
+            for _ in 0..4 {
+                d.u8()?;
+            }
+        }
+        op::SLEEP_MS => {
+            d.u8()?;
+        }
+        op::BUF_NEW => {
+            d.u8()?;
+            d.u8()?;
+        }
+        op::BUF_READ => {
+            for _ in 0..4 {
+                d.u8()?;
+            }
+        }
         op::CALL_EXT => {
             d.u8()?;
             d.u32()?;
+            d.u32()?;
+            let n = d.u8()?;
+            for _ in 0..n {
+                d.u8()?;
+            }
+        }
+        op::TAIL_CALL_EXT => {
+            d.u32()?;
+            d.u32()?;
+            let n = d.u8()?;
+            for _ in 0..n {
+                d.u8()?;
+            }
+        }
+        op::TAIL_CALL => {
             d.u32()?;
             let n = d.u8()?;
             for _ in 0..n {

@@ -175,6 +175,13 @@ fn helper_table() -> [u64; HELPER_COUNT] {
     t[Helper::BinCat as usize] = rt_bin_cat as usize as u64;
     t[Helper::ListCat as usize] = rt_list_cat as usize as u64;
     t[Helper::BinPart as usize] = rt_bin_part as usize as u64;
+    t[Helper::TailCallExt as usize] = rt_tail_call_ext as usize as u64;
+    t[Helper::TailCallLocal as usize] = rt_tail_call_local as usize as u64;
+    t[Helper::PortSubmit2 as usize] = rt_port_submit2 as usize as u64;
+    t[Helper::BufWrite as usize] = rt_buf_write as usize as u64;
+    t[Helper::SleepMs as usize] = rt_sleep_ms as usize as u64;
+    t[Helper::BufNew as usize] = rt_buf_new as usize as u64;
+    t[Helper::BufRead as usize] = rt_buf_read as usize as u64;
     t
 }
 
@@ -235,10 +242,7 @@ extern "C" fn rt_eq(a: u64, b: u64) -> u64 {
 
 extern "C" fn rt_make_tuple(ptr: *const Term, n: u64) -> u64 {
     let elems = unsafe { core::slice::from_raw_parts(ptr, n as usize) };
-    match proc::with_heap(|h| h.tuple(elems)) {
-        Ok(t) => t.0,
-        Err(HeapFull) => quota(),
-    }
+    proc::alloc_retry(|h| h.tuple(elems)).0
 }
 
 extern "C" fn rt_get_elem(t: u64, idx: u64) -> u64 {
@@ -253,10 +257,7 @@ extern "C" fn rt_get_elem(t: u64, idx: u64) -> u64 {
 }
 
 extern "C" fn rt_cons(h: u64, t: u64) -> u64 {
-    match proc::with_heap(|heap| heap.cons(Term(h), Term(t))) {
-        Ok(c) => c.0,
-        Err(HeapFull) => quota(),
-    }
+    proc::alloc_retry(|heap| heap.cons(Term(h), Term(t))).0
 }
 
 extern "C" fn rt_head(t: u64) -> u64 {
@@ -309,6 +310,73 @@ extern "C" fn rt_port_submit(port: u64, op: u64, arg0: u64, tag: u64) -> u64 {
     }
 }
 
+extern "C" fn rt_port_submit2(port: u64, op: u64, arg0: u64, arg1: u64, tag: u64) -> u64 {
+    let (Some(id), Some(o), Some(a0), Some(a1), Some(tg)) = (
+        Term(port).as_port(),
+        Term(op).as_int(),
+        Term(arg0).as_int(),
+        Term(arg1).as_int(),
+        Term(tag).as_int(),
+    ) else {
+        badarg()
+    };
+    let sqe = ygg_rings::Sqe { op: o as u32, tag: tg, arg0: a0 as u64, arg1: a1 as u64 };
+    if crate::ports::submit(id, sqe) {
+        0
+    } else {
+        badarg()
+    }
+}
+
+extern "C" fn rt_buf_write(buf: u64, off: u64, bin: u64) -> u64 {
+    let (Some(id), Some(off)) = (Term(buf).as_int(), Term(off).as_int()) else {
+        badarg()
+    };
+    let bin = Term(bin);
+    let bytes = unsafe {
+        if !bin.is_boxed() || bin.kind() != ygg_term::Kind::Binary || off < 0 {
+            badarg()
+        }
+        bin.bin_bytes()
+    };
+    if crate::ports::buf_write(id as u64, off as usize, bytes) {
+        Term::int(0).0
+    } else {
+        badarg()
+    }
+}
+
+extern "C" fn rt_buf_new(size: u64) -> u64 {
+    let Some(size) = Term(size).as_int() else { badarg() };
+    if size < 0 || size > 64 << 20 {
+        badarg()
+    }
+    Term::int(crate::ports::buf_create(alloc::vec![0u8; size as usize]) as i64).0
+}
+
+extern "C" fn rt_buf_read(buf: u64, off: u64, len: u64) -> u64 {
+    let (Some(id), Some(off), Some(len)) =
+        (Term(buf).as_int(), Term(off).as_int(), Term(len).as_int())
+    else {
+        badarg()
+    };
+    if off < 0 || len < 0 {
+        badarg()
+    }
+    let Some(data) = crate::ports::buf_read(id as u64, off as usize, len as usize) else {
+        badarg()
+    };
+    proc::alloc_retry(|h| h.binary(&data)).0
+}
+
+extern "C" fn rt_sleep_ms(ms: u64) {
+    let Some(ms) = Term(ms).as_int() else { badarg() };
+    if ms < 0 {
+        badarg()
+    }
+    let _ = proc::recv_where(|_| false, Some(ms as u64));
+}
+
 extern "C" fn rt_call_ext(matom: u64, fatom: u64, ptr: *const Term, n: u64) -> u64 {
     let (Some(ma), Some(fa)) = (Term(matom).as_atom(), Term(fatom).as_atom()) else {
         badarg()
@@ -341,10 +409,7 @@ extern "C" fn rt_trap_badarg() -> u64 {
 /// Arc that owns this generated code).
 extern "C" fn rt_bin_const(ptr: *const u8, len: u64) -> u64 {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len as usize) };
-    match proc::with_heap(|h| h.binary(bytes)) {
-        Ok(t) => t.0,
-        Err(HeapFull) => quota(),
-    }
+    proc::alloc_retry(|h| h.binary(bytes)).0
 }
 
 extern "C" fn rt_bin_from_list(list: u64) -> u64 {
@@ -363,10 +428,7 @@ extern "C" fn rt_bin_from_list(list: u64) -> u64 {
     if !cur.is_nil() {
         badarg();
     }
-    match proc::with_heap(|h| h.binary(&bytes)) {
-        Ok(t) => t.0,
-        Err(HeapFull) => quota(),
-    }
+    proc::alloc_retry(|h| h.binary(&bytes)).0
 }
 
 extern "C" fn rt_bin_to_list(bin: u64) -> u64 {
@@ -377,10 +439,7 @@ extern "C" fn rt_bin_to_list(bin: u64) -> u64 {
         }
         t.bin_bytes().iter().map(|&b| Term::int(b as i64)).collect()
     };
-    match proc::with_heap(|h| h.list(&elems)) {
-        Ok(l) => l.0,
-        Err(HeapFull) => quota(),
-    }
+    proc::alloc_retry(|h| h.list(&elems)).0
 }
 
 extern "C" fn rt_bin_size(bin: u64) -> u64 {
@@ -396,10 +455,7 @@ extern "C" fn rt_bin_size(bin: u64) -> u64 {
 extern "C" fn rt_buf_to_bin(id: u64) -> u64 {
     let Some(id) = Term(id).as_int() else { badarg() };
     let Some(data) = crate::ports::buf_take(id as u64) else { badarg() };
-    match proc::with_heap(|h| h.binary(&data)) {
-        Ok(t) => t.0,
-        Err(HeapFull) => quota(),
-    }
+    proc::alloc_retry(|h| h.binary(&data)).0
 }
 
 extern "C" fn rt_bin_to_buf(bin: u64) -> u64 {
@@ -413,19 +469,27 @@ extern "C" fn rt_bin_to_buf(bin: u64) -> u64 {
     Term::int(crate::ports::buf_create(data) as i64).0
 }
 
-fn map_or_die(r: Result<Term, ygg_term::MapError>) -> u64 {
-    match r {
-        Ok(t) => t.0,
-        Err(ygg_term::MapError::Heap(_)) => quota(),
-        Err(ygg_term::MapError::NonImmediateKey) => badarg(),
+fn map_retry(f: impl Fn(&mut ygg_term::Heap) -> Result<Term, ygg_term::MapError>) -> u64 {
+    loop {
+        match proc::with_heap(&f) {
+            Ok(t) => return t.0,
+            Err(ygg_term::MapError::NonImmediateKey) => badarg(),
+            Err(ygg_term::MapError::Heap(_)) => {
+                if !proc::grow_current_heap() {
+                    proc::exit("heap quota exceeded");
+                }
+            }
+        }
     }
 }
 
 extern "C" fn rt_map_new(ptr: *const Term, n_pairs: u64) -> u64 {
     let flat = unsafe { core::slice::from_raw_parts(ptr, 2 * n_pairs as usize) };
-    let mut pairs: alloc::vec::Vec<(Term, Term)> =
-        flat.chunks_exact(2).map(|c| (c[0], c[1])).collect();
-    map_or_die(proc::with_heap(|h| h.map_from_pairs(&mut pairs)))
+    map_retry(|h| {
+        let mut pairs: alloc::vec::Vec<(Term, Term)> =
+            flat.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        h.map_from_pairs(&mut pairs)
+    })
 }
 
 extern "C" fn rt_map_get(map: u64, key: u64) -> u64 {
@@ -447,7 +511,7 @@ extern "C" fn rt_map_put(map: u64, key: u64, val: u64) -> u64 {
         if !m.is_boxed() || m.kind() != ygg_term::Kind::Map {
             badarg();
         }
-        map_or_die(proc::with_heap(|h| h.map_put(m, Term(key), Term(val))))
+        map_retry(|h| unsafe { h.map_put(m, Term(key), Term(val)) })
     }
 }
 
@@ -470,10 +534,7 @@ extern "C" fn rt_bin_cat(a: u64, b: u64) -> u64 {
         v.extend_from_slice(b.bin_bytes());
         v
     };
-    match proc::with_heap(|h| h.binary(&joined)) {
-        Ok(t) => t.0,
-        Err(HeapFull) => quota(),
-    }
+    proc::alloc_retry(|h| h.binary(&joined)).0
 }
 
 extern "C" fn rt_list_cat(a: u64, b: u64) -> u64 {
@@ -488,17 +549,14 @@ extern "C" fn rt_list_cat(a: u64, b: u64) -> u64 {
     if !cur.is_nil() {
         badarg();
     }
-    let out = proc::with_heap(|h| {
+    proc::alloc_retry(|h| {
         let mut out = Term(b);
-        for e in elems.into_iter().rev() {
-            out = h.cons(e, out)?;
+        for e in elems.iter().rev() {
+            out = h.cons(*e, out)?;
         }
         Ok::<Term, ygg_term::HeapFull>(out)
-    });
-    match out {
-        Ok(t) => t.0,
-        Err(HeapFull) => quota(),
-    }
+    })
+    .0
 }
 
 extern "C" fn rt_bin_part(bin: u64, off: u64, len: u64) -> u64 {
@@ -517,8 +575,18 @@ extern "C" fn rt_bin_part(bin: u64, off: u64, len: u64) -> u64 {
         }
         bytes[off..off + len].to_vec()
     };
-    match proc::with_heap(|h| h.binary(&part)) {
-        Ok(t) => t.0,
-        Err(HeapFull) => quota(),
-    }
+    proc::alloc_retry(|h| h.binary(&part)).0
+}
+
+extern "C" fn rt_tail_call_ext(matom: u64, fatom: u64, ptr: *const Term, n: u64) {
+    let (Some(ma), Some(fa)) = (Term(matom).as_atom(), Term(fatom).as_atom()) else {
+        badarg()
+    };
+    let args = unsafe { core::slice::from_raw_parts(ptr, n as usize) };
+    proc::set_tail_target(ma, fa, args.to_vec());
+}
+
+extern "C" fn rt_tail_call_local(fn_idx: u64, ptr: *const Term, n: u64) {
+    let args = unsafe { core::slice::from_raw_parts(ptr, n as usize) };
+    proc::set_tail_target_local(fn_idx as u32, args.to_vec());
 }

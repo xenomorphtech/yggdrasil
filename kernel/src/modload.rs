@@ -124,8 +124,66 @@ pub fn current_process_module() -> Option<Arc<LoadedModule>> {
     }
 }
 
-/// Run a function of a loaded module under its best engine.
+/// Run a function of a loaded module, trampolining tail-call hops so
+/// tail-recursive bytecode runs in constant native stack. Never compacts:
+/// safe under nested `CALL_EXT` (outer frames hold live terms) and under
+/// native callers that keep heap terms across the call.
 pub fn invoke(m: &Arc<LoadedModule>, fn_idx: usize, args: &[Term]) -> Result<Term, Trap> {
+    invoke_inner(m, fn_idx, args, false)
+}
+
+/// Like `invoke`, but each tail hop is a GC point: the stashed args are
+/// treated as the process's *entire* live set and the heap is compacted.
+/// Contract: the caller must be the outermost engine entry for this process
+/// and must hold no process-heap terms across the call (spawn entries, or
+/// drivers whose roots are all immediates).
+pub fn invoke_gc(m: &Arc<LoadedModule>, fn_idx: usize, args: &[Term]) -> Result<Term, Trap> {
+    invoke_inner(m, fn_idx, args, true)
+}
+
+fn invoke_inner(
+    m: &Arc<LoadedModule>,
+    fn_idx: usize,
+    args: &[Term],
+    gc: bool,
+) -> Result<Term, Trap> {
+    let mut module = m.clone();
+    let mut fn_idx = fn_idx;
+    let mut args: alloc::vec::Vec<Term> = args.to_vec();
+    loop {
+        let r = invoke_once(&module, fn_idx, &args)?;
+        if r != ygg_interp::TAIL_SENTINEL {
+            debug_assert!(r.0 & 7 != 7, "reserved word escaped as a term");
+            return Ok(r);
+        }
+        match proc::take_tail_target().ok_or(Trap::BadCode)? {
+            proc::TailTarget::Ext(ma, fa, targs) => {
+                let mname = atoms::name(ma);
+                let target = current(mname).ok_or(Trap::Badarg)?;
+                let fname = atoms::name(fa);
+                let idx = target.module.function_named(fname).ok_or(Trap::Badarg)?;
+                if target.module.functions[idx].arity as usize != targs.len() {
+                    return Err(Trap::Badarg);
+                }
+                note_running(proc::current(), &target.name, target.version);
+                args = targs;
+                module = target;
+                fn_idx = idx;
+            }
+            proc::TailTarget::Local(idx, targs) => {
+                // Same module instance; the verifier already bounds-checked
+                // the index and matched the arity.
+                args = targs;
+                fn_idx = idx as usize;
+            }
+        }
+        if gc {
+            proc::maybe_compact(&mut args);
+        }
+    }
+}
+
+fn invoke_once(m: &Arc<LoadedModule>, fn_idx: usize, args: &[Term]) -> Result<Term, Trap> {
     if let Some(jit) = &m.jit {
         // Native fan-out for common arities; large-arity calls fall back to
         // the interpreter (same semantics, no JIT ABI for arity > 16).
@@ -259,7 +317,9 @@ extern "C" fn bytecode_entry(raw: u64) {
     let info = unsafe { alloc::boxed::Box::from_raw(raw as *mut SpawnInfo) };
     let f = &info.module.module.functions[info.fn_idx as usize];
     let args: &[Term] = if f.arity == 0 { &[] } else { &[info.arg] };
-    if let Err(trap) = invoke(&info.module, info.fn_idx as usize, args) {
+    // Spawn args are immediates (verifier-enforced) and this frame holds no
+    // heap terms across the run: tail hops may compact.
+    if let Err(trap) = invoke_gc(&info.module, info.fn_idx as usize, args) {
         exit_for_trap(trap);
     }
 }
@@ -328,9 +388,71 @@ impl SystemApi for KernelApi {
         }
     }
 
+    fn port_submit2(
+        &mut self,
+        port: Term,
+        op: Term,
+        arg0: Term,
+        arg1: Term,
+        tag: Term,
+    ) -> Result<(), Trap> {
+        let id = port.as_port().ok_or(Trap::Badarg)?;
+        let sqe = ygg_rings::Sqe {
+            op: op.as_int().ok_or(Trap::Badarg)? as u32,
+            tag: tag.as_int().ok_or(Trap::Badarg)?,
+            arg0: arg0.as_int().ok_or(Trap::Badarg)? as u64,
+            arg1: arg1.as_int().ok_or(Trap::Badarg)? as u64,
+        };
+        if crate::ports::submit(id, sqe) { Ok(()) } else { Err(Trap::Badarg) }
+    }
+
+    fn buf_write(&mut self, buf: Term, off: Term, bin: Term) -> Result<Term, Trap> {
+        let id = buf.as_int().ok_or(Trap::Badarg)?;
+        let off = off.as_int().ok_or(Trap::Badarg)?;
+        let bytes = unsafe {
+            if !bin.is_boxed() || bin.kind() != ygg_term::Kind::Binary || off < 0 {
+                return Err(Trap::Badarg);
+            }
+            bin.bin_bytes()
+        };
+        if crate::ports::buf_write(id as u64, off as usize, bytes) {
+            Ok(Term::int(0))
+        } else {
+            Err(Trap::Badarg)
+        }
+    }
+
+    fn sleep_ms(&mut self, ms: u64) {
+        // A never-matching receive: parks on the timer wheel, consumes no
+        // mailbox message.
+        let _ = proc::recv_where(|_| false, Some(ms));
+    }
+
+    fn buf_new(&mut self, size: Term) -> Result<Term, Trap> {
+        let size = size.as_int().ok_or(Trap::Badarg)?;
+        // Cap so bytecode can't exhaust the kernel heap (64 MiB covers any
+        // realistic framebuffer or DMA backing).
+        if size < 0 || size > 64 << 20 {
+            return Err(Trap::Badarg);
+        }
+        Ok(Term::int(crate::ports::buf_create(alloc::vec![0u8; size as usize]) as i64))
+    }
+
+    fn buf_read(&mut self, buf: Term, off: Term, len: Term) -> Result<Term, Trap> {
+        let id = buf.as_int().ok_or(Trap::Badarg)?;
+        let off = off.as_int().ok_or(Trap::Badarg)?;
+        let len = len.as_int().ok_or(Trap::Badarg)?;
+        if off < 0 || len < 0 {
+            return Err(Trap::Badarg);
+        }
+        let data =
+            crate::ports::buf_read(id as u64, off as usize, len as usize).ok_or(Trap::Badarg)?;
+        Ok(proc::alloc_retry(|h| h.binary(&data)))
+    }
+
     fn buf_to_bin(&mut self, id: i64) -> Result<Term, Trap> {
         let data = crate::ports::buf_take(id as u64).ok_or(Trap::Badarg)?;
-        proc::with_heap(|h| h.binary(&data)).map_err(|_| Trap::HeapFull)
+        Ok(proc::alloc_retry(|h| h.binary(&data)))
     }
 
     fn bin_to_buf(&mut self, bin: Term) -> Result<Term, Trap> {
@@ -341,6 +463,18 @@ impl SystemApi for KernelApi {
             bin.bin_bytes().to_vec()
         };
         Ok(Term::int(crate::ports::buf_create(data) as i64))
+    }
+
+    fn heap_grow(&mut self) -> bool {
+        proc::grow_current_heap()
+    }
+
+    fn tail_call(&mut self, module_atom: u32, fname_atom: u32, args: &[Term]) {
+        proc::set_tail_target(module_atom, fname_atom, args.to_vec());
+    }
+
+    fn tail_call_local(&mut self, fn_idx: u32, args: &[Term]) {
+        proc::set_tail_target_local(fn_idx, args.to_vec());
     }
 
     /// The hot-loading migration point: resolve module:fname in the *current*

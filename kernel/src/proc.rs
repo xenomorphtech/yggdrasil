@@ -35,6 +35,76 @@ pub enum State {
     Dead,
 }
 
+/// Per-process heap: a chain of physically contiguous spans, bump-allocated
+/// via `cur` (always the newest span). Growth is non-moving — terms in old
+/// spans stay valid, which is what keeps JIT-held pointers sound — and is
+/// capped by `max_pages` (the quota). Compaction happens at trampoline safe
+/// points (see `modload`), where the live set is exactly known.
+pub struct ProcHeap {
+    pub cur: Heap,
+    spans: Vec<(u64, usize)>, // (phys, pages)
+    max_pages: usize,
+    total_pages: usize,
+}
+
+impl ProcHeap {
+    fn new(initial_pages: usize, max_pages: usize) -> ProcHeap {
+        let pages = initial_pages.min(max_pages).max(1);
+        let phys = crate::mm::alloc_contig(pages, 1).expect("no frames for process heap");
+        let cur = unsafe { Heap::new(crate::mm::phys_to_virt(phys), pages * 4096) };
+        ProcHeap {
+            cur,
+            spans: alloc::vec![(phys, pages)],
+            max_pages,
+            total_pages: pages,
+        }
+    }
+
+    /// Add a span (doubling, clamped to the quota). False at the cap.
+    pub fn grow(&mut self) -> bool {
+        if self.total_pages >= self.max_pages {
+            return false;
+        }
+        let next = self.total_pages.min(self.max_pages - self.total_pages);
+        let phys = match crate::mm::alloc_contig(next, 1) {
+            Some(p) => p,
+            None => return false,
+        };
+        self.spans.push((phys, next));
+        self.total_pages += next;
+        // Terms in the old span remain valid; only the bump target moves.
+        self.cur = unsafe { Heap::new(crate::mm::phys_to_virt(phys), next * 4096) };
+        true
+    }
+
+    /// Replace all spans with a single fresh one (compaction target).
+    /// Returns the old spans for the caller to free *after* evacuation.
+    pub fn begin_compact(&mut self, live_words: usize) -> Option<Vec<(u64, usize)>> {
+        let pages = ((live_words * 8).div_ceil(4096)).clamp(4, self.max_pages);
+        let phys = crate::mm::alloc_contig(pages, 1)?;
+        let old = core::mem::replace(&mut self.spans, alloc::vec![(phys, pages)]);
+        self.total_pages = pages;
+        self.cur = unsafe { Heap::new(crate::mm::phys_to_virt(phys), pages * 4096) };
+        Some(old)
+    }
+
+    pub fn total_pages(&self) -> usize {
+        self.total_pages
+    }
+    pub fn span_count(&self) -> usize {
+        self.spans.len()
+    }
+    fn take_spans(&mut self) -> Vec<(u64, usize)> {
+        core::mem::take(&mut self.spans)
+    }
+}
+
+pub fn free_spans(spans: Vec<(u64, usize)>) {
+    for (phys, pages) in spans {
+        crate::mm::free_frames(phys, pages);
+    }
+}
+
 /// A message in flight: deep-copied out of the sender into its own kernel-heap
 /// backing (BEAM's heap fragments). The receiver copies it into its heap at
 /// receive time — so no CPU ever writes another CPU's process heap.
@@ -77,10 +147,10 @@ pub struct Process {
     /// Saved rsp while switched out.
     rsp: u64,
     stack_slot: u64,
-    heap: Heap,
-    heap_span: u64,
-    heap_pages: usize,
+    heap: ProcHeap,
     mailbox: VecDeque<Fragment>,
+    /// Tail-call target stashed by the engines for the invoke trampoline.
+    tail_target: Option<TailTarget>,
     /// Killed while Running on a core: honored at its next safepoint.
     kill_pending: bool,
     /// Bidirectional links (exit-signal propagation).
@@ -211,8 +281,7 @@ fn spawn_inner(
         p.add(6).write(ctx::trampoline as usize as u64);
     }
 
-    let span = crate::mm::alloc_contig(heap_pages, 1).expect("no frames for process heap");
-    let heap = unsafe { Heap::new(crate::mm::phys_to_virt(span), heap_pages * 4096) };
+    let heap = ProcHeap::new(16, heap_pages);
 
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let mut links = Vec::new();
@@ -232,9 +301,8 @@ fn spawn_inner(
                 rsp,
                 stack_slot: slot,
                 heap,
-                heap_span: span,
-                heap_pages,
                 mailbox: VecDeque::new(),
+                tail_target: None,
                 kill_pending: false,
                 links,
                 monitors,
@@ -262,7 +330,86 @@ pub fn monitor(target: Pid) -> u64 {
 pub fn with_heap<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
     let pid = current();
     let mut t = TABLE.lock();
-    f(&mut t.get_mut(&pid).expect("no current process").heap)
+    f(&mut t.get_mut(&pid).expect("no current process").heap.cur)
+}
+
+/// A stashed tail-call target awaiting the engine trampoline.
+pub enum TailTarget {
+    /// Cross-module: resolve `module:fname` in the *current* module table
+    /// (this hop is the hot-load migration point).
+    Ext(u32, u32, Vec<Term>),
+    /// Local: function index in the module instance already running (BEAM
+    /// local-call semantics — stays in the same version).
+    Local(u32, Vec<Term>),
+}
+
+pub fn set_tail_target(module_atom: u32, fname_atom: u32, args: Vec<Term>) {
+    let pid = current();
+    let mut t = TABLE.lock();
+    t.get_mut(&pid).expect("no current process").tail_target =
+        Some(TailTarget::Ext(module_atom, fname_atom, args));
+}
+
+pub fn set_tail_target_local(fn_idx: u32, args: Vec<Term>) {
+    let pid = current();
+    let mut t = TABLE.lock();
+    t.get_mut(&pid).expect("no current process").tail_target =
+        Some(TailTarget::Local(fn_idx, args));
+}
+
+pub fn take_tail_target() -> Option<TailTarget> {
+    let pid = current();
+    let mut t = TABLE.lock();
+    t.get_mut(&pid).expect("no current process").tail_target.take()
+}
+
+/// Trampoline-point GC: the process has no live frames; `roots` is its entire
+/// live term set. Compact into a fresh span sized to the live estimate and
+/// free everything else. No-op unless there's actual pressure.
+pub fn maybe_compact(roots: &mut [Term]) {
+    let pid = current();
+    let old_spans = {
+        let mut t = TABLE.lock();
+        let p = t.get_mut(&pid).expect("no current process");
+        let pressured = p.heap.span_count() > 1
+            || p.heap.cur.used_bytes() * 2 > p.heap.cur.capacity_bytes();
+        if !pressured {
+            return;
+        }
+        // term_size_words over-counts shared structure — a safe upper bound.
+        let live: usize =
+            roots.iter().map(|r| unsafe { ygg_term::term_size_words(*r) }).sum::<usize>()
+                + roots.len()
+                + 32;
+        let Some(old) = p.heap.begin_compact(live) else {
+            return; // allocation pressure: skip this cycle
+        };
+        unsafe { ygg_term::evacuate(roots, &mut p.heap.cur) }
+            .expect("compaction target sized from live estimate");
+        old
+    };
+    free_spans(old_spans);
+}
+
+/// Grow the current process's heap by one span. False at the quota cap.
+pub fn grow_current_heap() -> bool {
+    let pid = current();
+    let mut t = TABLE.lock();
+    t.get_mut(&pid).expect("no current process").heap.grow()
+}
+
+/// Allocate with grow-on-full retry; dies of quota breach only at the cap.
+pub fn alloc_retry<R>(f: impl Fn(&mut Heap) -> Result<R, HeapFull>) -> R {
+    loop {
+        match with_heap(&f) {
+            Ok(r) => return r,
+            Err(HeapFull) => {
+                if !grow_current_heap() {
+                    exit("heap quota exceeded");
+                }
+            }
+        }
+    }
 }
 
 /// Raw pointer to the current process's heap, for the execution engines.
@@ -275,12 +422,9 @@ pub fn current_heap_ptr() -> *mut Heap {
     p as *mut Heap
 }
 
-/// Build a term or die of quota breach.
-pub fn build(f: impl FnOnce(&mut Heap) -> Result<Term, HeapFull>) -> Term {
-    match with_heap(f) {
-        Ok(t) => t,
-        Err(HeapFull) => exit("heap quota exceeded"),
-    }
+/// Build a term, growing the heap as needed; dies only at the quota cap.
+pub fn build(f: impl Fn(&mut Heap) -> Result<Term, HeapFull>) -> Term {
+    alloc_retry(f)
 }
 
 /// Switch from the current process back to this core's scheduler.
@@ -432,10 +576,15 @@ pub fn recv_where(pred: impl Fn(Term) -> bool, timeout_ms: Option<u64>) -> Optio
             let mut quota_death = false;
             let mut matched: Option<Term> = None;
             for i in 0..p.mailbox.len() {
-                let watermark = p.heap.used_bytes();
-                let copied = match unsafe { copy_term(p.mailbox[i].root, &mut p.heap) } {
+                let watermark = p.heap.cur.used_bytes();
+                let copied = match unsafe { copy_term(p.mailbox[i].root, &mut p.heap.cur) } {
                     Ok(c) => c,
                     Err(HeapFull) => {
+                        // A fresh span gives the copy contiguous room; retry
+                        // next loop pass. At the cap, die of quota breach.
+                        if p.heap.grow() {
+                            continue;
+                        }
                         quota_death = true;
                         break;
                     }
@@ -445,7 +594,7 @@ pub fn recv_where(pred: impl Fn(Term) -> bool, timeout_ms: Option<u64>) -> Optio
                     matched = Some(copied);
                     break;
                 }
-                p.heap.truncate_to(watermark);
+                p.heap.cur.truncate_to(watermark);
             }
             if quota_death {
                 drop(t);
@@ -568,7 +717,7 @@ pub fn run() -> ! {
         };
         let heap_ptr = {
             let mut t = TABLE.lock();
-            &raw mut t.get_mut(&pid).unwrap().heap as u64
+            &raw mut t.get_mut(&pid).unwrap().heap.cur as u64
         };
         me.phase.store(5, Ordering::Relaxed);
         me.current.store(pid, Ordering::Relaxed);
@@ -632,8 +781,7 @@ pub fn run() -> ! {
 struct Finalize {
     pid: Pid,
     stack_slot: u64,
-    heap_span: u64,
-    heap_pages: usize,
+    heap_spans: Vec<(u64, usize)>,
 }
 
 /// Free a dead process's resources. MUST run with the TABLE lock dropped:
@@ -641,7 +789,7 @@ struct Finalize {
 /// broadcasts a TLB shootdown that must not stall other cores against TABLE.
 fn finalize(fin: Finalize) {
     crate::vmm::unmap_stack(fin.stack_slot);
-    crate::mm::free_frames(fin.heap_span, fin.heap_pages);
+    free_spans(fin.heap_spans);
     crate::ports::close_owned_by(fin.pid);
 }
 
@@ -664,11 +812,11 @@ fn reap(t: &mut Table, pid: Pid) -> Finalize {
         }
     }
 
+    let mut p = p;
     Finalize {
         pid,
         stack_slot: p.stack_slot,
-        heap_span: p.heap_span,
-        heap_pages: p.heap_pages,
+        heap_spans: p.heap.take_spans(),
     }
 }
 
