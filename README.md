@@ -10,9 +10,10 @@ BEAM where it's proven, modernized where technology moved on:
 | | |
 |---|---|
 | **Processes** | Green threads with isolated term heaps, own native stacks (goroutine model), guard pages. A crashing/overflowing/quota-breaching process dies alone. |
-| **Messaging** | Copy-on-send into the receiver's heap, mailboxes, selective receive, `receive … after` via timer wheel. |
+| **Messaging** | Copy-on-send via heap fragments (no core ever writes another core's heap), mailboxes, selective receive, `receive … after` via timer wheel. |
 | **Supervision** | Links propagate exit signals (hop-by-hop at reap); monitors deliver `{'DOWN', Ref, Pid, Reason}`. |
-| **Preemption** | LAPIC timer sets a preempt flag; interpreter back-edges and JIT-emitted safepoints yield. The timer interrupt never context-switches. |
+| **Preemption** | Per-core LAPIC timers set per-CPU preempt flags; interpreter back-edges and JIT-emitted safepoints yield. Timer interrupts never context-switch. |
+| **SMP** | Limine MP bring-up, per-CPU run queues with work stealing, wake IPIs, TLB-shootdown IPIs for stack recycling, panic halts all cores. |
 | **Ports** | Every device is an SQ/CQ ring pair owned by a process (the shape virtio/NVMe/io_uring converged on). Completions arrive as ordinary messages. Serial (IRQ-driven), virtio-blk, virtio-net. |
 | **Code** | Custom register bytecode, load-time **verifier** (the security boundary), two-version **hot code loading** with `call_ext` migration and `purge`. |
 | **Execution** | Tier 0: interpreter. Tier 1: **Cranelift JIT compiled in-kernel** (no_std cranelift 0.134), published into an RX code zone with hand-rolled relocation patching. Differentially tested against the interpreter. |
@@ -51,12 +52,34 @@ differential), types `PING` at a bytecode echo server over the emulated
 serial line, writes a disk pattern, **reboots** to verify persistence, and
 greps the guest's UDP payload out of a pcap of the virtual NIC.
 
+## The Lux TCP/IP stack
+
+Yggdrasil runs a real TCP/IP stack written in [Lux](../lux) (`examples/tcp_ip.lux`),
+compiled by Lux's Yggdrasil backend into 54 content-addressed, verified bytecode
+modules and JIT-compiled in-kernel. A native adapter owns the NIC (ethernet +
+ARP); every TCP protocol decision — handshake, checksums, ACKs, teardown — is
+Lux bytecode calling through `CALL_EXT`. The test suite proves it end to end: a
+real host TCP client connects through QEMU's user-net (`hostfwd`), and the Lux
+stack accepts the connection and echoes the payload back.
+
+Supporting ops added for this: bit ops (`band/bor/bxor/bsl/bsr/bnot`), binaries
+(`BIN_NEW/FROM_LIST/TO_LIST/SIZE/CAT/PART`, `IS_BINARY`), flat maps with
+immediate keys (`MAP_NEW/GET/PUT` — the struct representation, same shape BEAM
+uses below 33 keys), `LIST_CAT`, and the packet-buffer bridge
+(`BUF_TO_BIN`/`BIN_TO_BUF`). `tools/ygg-run` executes a luxpack on the host
+under either engine (`--jit` mmaps and runs the Cranelift output in userspace)
+for fast differential debugging.
+
 ## Status
 
-Milestones M0–M8 complete (boot → memory → processes → full semantics →
+Milestones M0–M10 complete (boot → memory → processes → full semantics →
 bytecode/interpreter → ports → virtio → verifier → hot loading → Cranelift
-JIT). Single core; SMP (per-CPU run queues, work stealing) is the next
-milestone — the scheduler structure is already per-CPU-shaped. Other known
-deferrals: per-process GC (heaps are fixed-quota bump arenas; `copy_term` is
-the seed of the future semispace collector), floats, arrays/maps as first-class
-term kinds, buffer handles exposed to bytecode.
+JIT → Lux TCP/IP stack → **SMP**). The suite runs on 4 cores: Limine MP
+bring-up, per-CPU state behind a `gs:[0]` accessor (run queues, preempt flags,
+scheduler contexts, TSS/IST), BEAM-style heap *fragments* so no core ever
+writes another core's process heap, work stealing with wake IPIs, TLB
+shootdown for stack-slot recycling, and tests that only pass with true
+parallelism (an unpreemptible spinner released by concurrently-running code).
+Known deferrals: per-process GC (heaps are fixed-quota bump arenas;
+`copy_term` is the seed of the future semispace collector), floats, arrays as
+a first-class term kind.

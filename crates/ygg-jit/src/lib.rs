@@ -29,7 +29,7 @@ use alloc::vec::Vec;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    AbiParam, ExtFuncData, ExternalName, FuncRef, InstBuilder, MemFlags, Signature, StackSlotData,
+    AbiParam, ExtFuncData, ExternalName, FuncRef, InstBuilder, Signature, StackSlotData,
     StackSlotKind, TrapCode, UserExternalName, UserFuncName, types,
 };
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
@@ -61,9 +61,21 @@ pub enum Helper {
     CallExt = 14,    // (module_atom, fname_atom, ptr, n) -> term
     ExitAtom = 15,   // (atom) -> ! (never returns)
     TrapBadarg = 16, // () -> ! (never returns)
+    BinConst = 17,   // (ptr, len) -> binary  (ptr into the module's bytecode)
+    BinFromList = 18, // (list) -> binary
+    BinToList = 19,  // (binary) -> list
+    BinSize = 20,    // (binary) -> int term
+    BufToBin = 21,   // (int term buffer id) -> binary
+    BinToBuf = 22,   // (binary) -> int term buffer id
+    MapNew = 23,     // (ptr to k/v pairs, n_pairs) -> map
+    MapGet = 24,     // (map, key) -> value
+    MapPut = 25,     // (map, key, val) -> map
+    IsBinary = 26,   // (term) -> raw 0/1
+    BinCat = 27,     // (bin, bin) -> bin
+    ListCat = 28,    // (list, term) -> list
+    BinPart = 29,    // (bin, off, len) -> bin
 }
-
-pub const HELPER_COUNT: usize = 17;
+pub const HELPER_COUNT: usize = 30;
 
 fn helper_nargs(h: u32) -> usize {
     match h {
@@ -83,6 +95,19 @@ fn helper_nargs(h: u32) -> usize {
         x if x == Helper::PortSubmit as u32 => 4,
         x if x == Helper::CallExt as u32 => 4,
         x if x == Helper::ExitAtom as u32 => 1,
+        x if x == Helper::BinConst as u32 => 2,
+        x if x == Helper::BinFromList as u32 => 1,
+        x if x == Helper::BinToList as u32 => 1,
+        x if x == Helper::BinSize as u32 => 1,
+        x if x == Helper::BufToBin as u32 => 1,
+        x if x == Helper::BinToBuf as u32 => 1,
+        x if x == Helper::MapNew as u32 => 2,
+        x if x == Helper::MapGet as u32 => 2,
+        x if x == Helper::MapPut as u32 => 3,
+        x if x == Helper::IsBinary as u32 => 1,
+        x if x == Helper::BinCat as u32 => 2,
+        x if x == Helper::ListCat as u32 => 2,
+        x if x == Helper::BinPart as u32 => 3,
         _ => 0,
     }
 }
@@ -177,7 +202,10 @@ impl<'a> Dec<'a> {
         Ok(v)
     }
     fn u32(&mut self) -> Result<u32, JitError> {
-        let s = self.code.get(self.pc..self.pc + 4).ok_or(JitError::BadBytecode)?;
+        let s = self
+            .code
+            .get(self.pc..self.pc + 4)
+            .ok_or(JitError::BadBytecode)?;
         self.pc += 4;
         Ok(u32::from_le_bytes(s.try_into().unwrap()))
     }
@@ -185,7 +213,10 @@ impl<'a> Dec<'a> {
         Ok(self.u32()? as i32)
     }
     fn i64(&mut self) -> Result<i64, JitError> {
-        let s = self.code.get(self.pc..self.pc + 8).ok_or(JitError::BadBytecode)?;
+        let s = self
+            .code
+            .get(self.pc..self.pc + 8)
+            .ok_or(JitError::BadBytecode)?;
         self.pc += 8;
         Ok(i64::from_le_bytes(s.try_into().unwrap()))
     }
@@ -231,7 +262,56 @@ fn find_leaders(code: &[u8]) -> Result<BTreeSet<usize>, JitError> {
                 d.u8()?;
                 d.u8()?;
             }
-            op::CONS | op::ADD | op::SUB | op::MUL | op::CMP_EQ | op::CMP_LT => {
+            op::CONS
+            | op::ADD
+            | op::SUB
+            | op::MUL
+            | op::CMP_EQ
+            | op::CMP_LT
+            | op::BAND
+            | op::BOR
+            | op::BXOR
+            | op::BSL
+            | op::BSR
+            | op::BIN_CAT
+            | op::LIST_CAT => {
+                d.u8()?;
+                d.u8()?;
+                d.u8()?;
+            }
+            op::BNOT
+            | op::BIN_FROM_LIST
+            | op::BIN_TO_LIST
+            | op::BIN_SIZE
+            | op::BUF_TO_BIN
+            | op::BIN_TO_BUF
+            | op::IS_BINARY => {
+                d.u8()?;
+                d.u8()?;
+            }
+            op::BIN_NEW => {
+                d.u8()?;
+                let len = d.u32()? as usize;
+                if d.pc + len > d.code.len() {
+                    return Err(JitError::BadBytecode);
+                }
+                d.pc += len;
+            }
+            op::MAP_NEW => {
+                d.u8()?;
+                let n = d.u8()?;
+                for _ in 0..n {
+                    d.u8()?;
+                    d.u8()?;
+                }
+            }
+            op::MAP_GET => {
+                d.u8()?;
+                d.u8()?;
+                d.u8()?;
+            }
+            op::MAP_PUT | op::BIN_PART => {
+                d.u8()?;
                 d.u8()?;
                 d.u8()?;
                 d.u8()?;
@@ -307,7 +387,10 @@ impl<'a, 'b> Tx<'a, 'b> {
         let name_ref = self
             .b
             .func
-            .declare_imported_user_function(UserExternalName { namespace: 0, index: idx });
+            .declare_imported_user_function(UserExternalName {
+                namespace: 0,
+                index: idx,
+            });
         let mut sig = Signature::new(self.call_conv);
         for _ in 0..helper_nargs(idx) {
             sig.params.push(AbiParam::new(types::I64));
@@ -333,7 +416,10 @@ impl<'a, 'b> Tx<'a, 'b> {
         let name_ref = self
             .b
             .func
-            .declare_imported_user_function(UserExternalName { namespace: 1, index: fn_idx });
+            .declare_imported_user_function(UserExternalName {
+                namespace: 1,
+                index: fn_idx,
+            });
         let arity = self.m.functions[fn_idx as usize].arity as usize;
         let sig = fn_signature(arity, self.call_conv);
         let sig = self.b.import_signature(sig);
@@ -356,7 +442,10 @@ impl<'a, 'b> Tx<'a, 'b> {
     /// Branch to the trap block unless `v` is a small int; returns untagged i64.
     fn expect_int(&mut self, v: ir::Value) -> ir::Value {
         let tag = self.b.ins().band_imm(v, 7);
-        let ok = self.b.ins().icmp_imm(IntCC::Equal, tag, ygg_term::TAG_INT as i64);
+        let ok = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag, ygg_term::TAG_INT as i64);
         let cont = self.b.create_block();
         self.b.ins().brif(ok, cont, &[], self.trap_block, &[]);
         self.b.switch_to_block(cont);
@@ -369,16 +458,21 @@ impl<'a, 'b> Tx<'a, 'b> {
     }
 
     fn atom_const(&mut self, local: u32) -> Result<ir::Value, JitError> {
-        let global = *self.atom_map.get(local as usize).ok_or(JitError::BadBytecode)?;
+        let global = *self
+            .atom_map
+            .get(local as usize)
+            .ok_or(JitError::BadBytecode)?;
         Ok(self.b.ins().iconst(types::I64, Term::atom(global).0 as i64))
     }
 
     /// Spill values into a fresh stack slot; returns its address.
     fn spill(&mut self, vals: &[ir::Value]) -> ir::Value {
         let size = (vals.len().max(1) * 8) as u32;
-        let ss = self
-            .b
-            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3));
+        let ss = self.b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            size,
+            3,
+        ));
         for (i, v) in vals.iter().enumerate() {
             self.b.ins().stack_store(types::I64, *v, ss, (i * 8) as i32);
         }
@@ -406,7 +500,9 @@ fn compile_fn(
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
 
-        let regs: Vec<Variable> = (0..f.nregs as usize).map(|_| b.declare_var(types::I64)).collect();
+        let regs: Vec<Variable> = (0..f.nregs as usize)
+            .map(|_| b.declare_var(types::I64))
+            .collect();
         let params: Vec<ir::Value> = b.block_params(entry).to_vec();
         let nil = b.ins().iconst(types::I64, Term::NIL.0 as i64);
         for (i, var) in regs.iter().enumerate() {
@@ -432,7 +528,10 @@ fn compile_fn(
             siblings: BTreeMap::new(),
         };
 
-        let mut d = Dec { code: &f.code, pc: 0 };
+        let mut d = Dec {
+            code: &f.code,
+            pc: 0,
+        };
         let mut filled = true; // entry jump emitted
         let mut in_block = false;
         while d.pc < f.code.len() {
@@ -518,7 +617,11 @@ fn compile_fn(
                     let rd = d.u8()? as usize;
                     let rs = d.u8()? as usize;
                     let t = tx.b.use_var(tx.regs[rs]);
-                    let h = if opcode == op::HEAD { Helper::Head } else { Helper::Tail };
+                    let h = if opcode == op::HEAD {
+                        Helper::Head
+                    } else {
+                        Helper::Tail
+                    };
                     let v = tx.call_helper(h, &[t]).unwrap();
                     tx.b.def_var(tx.regs[rd], v);
                 }
@@ -677,6 +780,149 @@ fn compile_fn(
                     let v = tx.call_helper(Helper::CallExt, &[ma, fa, ptr, nv]).unwrap();
                     tx.b.def_var(tx.regs[rd], v);
                 }
+                op::BAND | op::BOR | op::BXOR => {
+                    let rd = d.u8()? as usize;
+                    let ra = d.u8()? as usize;
+                    let rb = d.u8()? as usize;
+                    let a = tx.b.use_var(tx.regs[ra]);
+                    let b_ = tx.b.use_var(tx.regs[rb]);
+                    let ua = tx.expect_int(a);
+                    let ub = tx.expect_int(b_);
+                    // Bitops on sign-extended i61 values stay valid i61.
+                    let raw = match opcode {
+                        op::BAND => tx.b.ins().band(ua, ub),
+                        op::BOR => tx.b.ins().bor(ua, ub),
+                        _ => tx.b.ins().bxor(ua, ub),
+                    };
+                    let v = tx.retag_int(raw);
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::BSL | op::BSR => {
+                    let rd = d.u8()? as usize;
+                    let ra = d.u8()? as usize;
+                    let rb = d.u8()? as usize;
+                    let a = tx.b.use_var(tx.regs[ra]);
+                    let b_ = tx.b.use_var(tx.regs[rb]);
+                    let ua = tx.expect_int(a);
+                    let ub = tx.expect_int(b_);
+                    // Shift amount must be 0..=60 (i61 world), else trap.
+                    let in_range =
+                        tx.b.ins()
+                            .icmp_imm(IntCC::UnsignedLessThanOrEqual, ub, 60);
+                    let cont = tx.b.create_block();
+                    tx.b.ins().brif(in_range, cont, &[], tx.trap_block, &[]);
+                    tx.b.switch_to_block(cont);
+                    let raw = if opcode == op::BSL {
+                        tx.b.ins().ishl(ua, ub)
+                    } else {
+                        tx.b.ins().sshr(ua, ub)
+                    };
+                    let v = tx.retag_int(raw);
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::BNOT => {
+                    let rd = d.u8()? as usize;
+                    let rs = d.u8()? as usize;
+                    let a = tx.b.use_var(tx.regs[rs]);
+                    let ua = tx.expect_int(a);
+                    let raw = tx.b.ins().bnot(ua);
+                    let v = tx.retag_int(raw);
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::BIN_NEW => {
+                    let rd = d.u8()? as usize;
+                    let len = d.u32()? as usize;
+                    if d.pc + len > d.code.len() {
+                        return Err(JitError::BadBytecode);
+                    }
+                    // The constant bytes live inside the module's bytecode,
+                    // which the kernel keeps alive as long as this code runs.
+                    let ptr = d.code[d.pc..].as_ptr() as i64;
+                    d.pc += len;
+                    let pv = tx.b.ins().iconst(types::I64, ptr);
+                    let lv = tx.b.ins().iconst(types::I64, len as i64);
+                    let v = tx.call_helper(Helper::BinConst, &[pv, lv]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::MAP_NEW => {
+                    let rd = d.u8()? as usize;
+                    let n = d.u8()? as usize;
+                    let mut vals = Vec::with_capacity(2 * n);
+                    for _ in 0..n {
+                        let rk = d.u8()? as usize;
+                        let rv = d.u8()? as usize;
+                        vals.push(tx.b.use_var(tx.regs[rk]));
+                        vals.push(tx.b.use_var(tx.regs[rv]));
+                    }
+                    let ptr = tx.spill(&vals);
+                    let nv = tx.b.ins().iconst(types::I64, n as i64);
+                    let v = tx.call_helper(Helper::MapNew, &[ptr, nv]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::MAP_GET => {
+                    let rd = d.u8()? as usize;
+                    let rm = d.u8()? as usize;
+                    let rk = d.u8()? as usize;
+                    let m = tx.b.use_var(tx.regs[rm]);
+                    let k = tx.b.use_var(tx.regs[rk]);
+                    let v = tx.call_helper(Helper::MapGet, &[m, k]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::MAP_PUT => {
+                    let rd = d.u8()? as usize;
+                    let rm = d.u8()? as usize;
+                    let rk = d.u8()? as usize;
+                    let rv = d.u8()? as usize;
+                    let m = tx.b.use_var(tx.regs[rm]);
+                    let k = tx.b.use_var(tx.regs[rk]);
+                    let v0 = tx.b.use_var(tx.regs[rv]);
+                    let v = tx.call_helper(Helper::MapPut, &[m, k, v0]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::BIN_FROM_LIST | op::BIN_TO_LIST | op::BIN_SIZE | op::BUF_TO_BIN
+                | op::BIN_TO_BUF => {
+                    let rd = d.u8()? as usize;
+                    let rs = d.u8()? as usize;
+                    let a = tx.b.use_var(tx.regs[rs]);
+                    let h = match opcode {
+                        op::BIN_FROM_LIST => Helper::BinFromList,
+                        op::BIN_TO_LIST => Helper::BinToList,
+                        op::BIN_SIZE => Helper::BinSize,
+                        op::BUF_TO_BIN => Helper::BufToBin,
+                        _ => Helper::BinToBuf,
+                    };
+                    let v = tx.call_helper(h, &[a]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::BIN_PART => {
+                    let rd = d.u8()? as usize;
+                    let rb = d.u8()? as usize;
+                    let ro = d.u8()? as usize;
+                    let rl = d.u8()? as usize;
+                    let b_ = tx.b.use_var(tx.regs[rb]);
+                    let o = tx.b.use_var(tx.regs[ro]);
+                    let l = tx.b.use_var(tx.regs[rl]);
+                    let v = tx.call_helper(Helper::BinPart, &[b_, o, l]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::IS_BINARY => {
+                    let rd = d.u8()? as usize;
+                    let rs = d.u8()? as usize;
+                    let a = tx.b.use_var(tx.regs[rs]);
+                    let raw = tx.call_helper(Helper::IsBinary, &[a]).unwrap();
+                    let v = tx.retag_int(raw);
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::BIN_CAT | op::LIST_CAT => {
+                    let rd = d.u8()? as usize;
+                    let ra = d.u8()? as usize;
+                    let rb = d.u8()? as usize;
+                    let a = tx.b.use_var(tx.regs[ra]);
+                    let b_ = tx.b.use_var(tx.regs[rb]);
+                    let h = if opcode == op::BIN_CAT { Helper::BinCat } else { Helper::ListCat };
+                    let v = tx.call_helper(h, &[a, b_]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
                 _ => return Err(JitError::BadBytecode),
             }
         }
@@ -721,7 +967,12 @@ fn compile_fn(
             }
             _ => return Err(JitError::UnsupportedReloc),
         };
-        relocs.push(RelocEntry { offset, kind, target, addend });
+        relocs.push(RelocEntry {
+            offset,
+            kind,
+            target,
+            addend,
+        });
     }
     Ok(CompiledFn { code, relocs })
 }
@@ -752,7 +1003,57 @@ fn skip_insn(d: &mut Dec) -> Result<(), JitError> {
                 d.u8()?;
             }
         }
-        op::GET_ELEM | op::CONS | op::ADD | op::SUB | op::MUL | op::CMP_EQ | op::CMP_LT => {
+        op::GET_ELEM
+        | op::CONS
+        | op::ADD
+        | op::SUB
+        | op::MUL
+        | op::CMP_EQ
+        | op::CMP_LT
+        | op::BAND
+        | op::BOR
+        | op::BXOR
+        | op::BSL
+        | op::BSR
+        | op::BIN_CAT
+        | op::LIST_CAT => {
+            d.u8()?;
+            d.u8()?;
+            d.u8()?;
+        }
+        op::BNOT
+        | op::BIN_FROM_LIST
+        | op::BIN_TO_LIST
+        | op::BIN_SIZE
+        | op::BUF_TO_BIN
+        | op::BIN_TO_BUF
+        | op::IS_BINARY => {
+            d.u8()?;
+            d.u8()?;
+        }
+        op::BIN_NEW => {
+            d.u8()?;
+            let len = d.u32()? as usize;
+            if d.pc + len > d.code.len() {
+                return Err(JitError::BadBytecode);
+            }
+            d.pc += len;
+        }
+        op::MAP_NEW => {
+            d.u8()?;
+            let n = d.u8()?;
+            for _ in 0..n {
+                d.u8()?;
+                d.u8()?;
+            }
+        }
+        op::MAP_GET => {
+            d.u8()?;
+            d.u8()?;
+            d.u8()?;
+        }
+        op::MAP_PUT | op::BIN_PART => {
+            d.u8()?;
             d.u8()?;
             d.u8()?;
             d.u8()?;
@@ -843,9 +1144,9 @@ mod tests {
                     };
                     let at = base.add(off + r.offset as usize);
                     match r.kind {
-                        RelocKind::Abs8 => {
-                            at.cast::<u64>().write_unaligned((target as i64 + r.addend) as u64)
-                        }
+                        RelocKind::Abs8 => at
+                            .cast::<u64>()
+                            .write_unaligned((target as i64 + r.addend) as u64),
                         RelocKind::PcRel4 => {
                             let rel = target as i64 + r.addend - at as i64;
                             at.cast::<i32>().write_unaligned(rel as i32);
@@ -882,7 +1183,12 @@ mod tests {
     fn one_fn_module(code: Vec<u8>, arity: u8, nregs: u8) -> Module {
         Module {
             atoms: vec!["main".into(), "extra".into()],
-            functions: vec![Function { name_atom: 0, arity, nregs, code }],
+            functions: vec![Function {
+                name_atom: 0,
+                arity,
+                nregs,
+                code,
+            }],
         }
     }
 
@@ -941,6 +1247,31 @@ mod tests {
         let addrs = load_exec(&fns, &helpers());
         let f: extern "C" fn(u64) -> u64 = unsafe { core::mem::transmute(addrs[0]) };
         assert_eq!(Term(f(Term::int(10).0)).as_int(), Some(3628800));
+    }
+
+    #[test]
+    fn bit_ops_execute() {
+        let mut b = CodeBuilder::new();
+        b.u8(op::LOAD_INT).u8(1).i64(0xFF);
+        b.u8(op::BAND).u8(2).u8(0).u8(1); // x & 0xFF
+        b.u8(op::LOAD_INT).u8(1).i64(0x100);
+        b.u8(op::BOR).u8(2).u8(2).u8(1); // | 0x100
+        b.u8(op::LOAD_INT).u8(1).i64(4);
+        b.u8(op::LOAD_INT).u8(3).i64(1);
+        b.u8(op::BSL).u8(3).u8(3).u8(1); // 1 << 4
+        b.u8(op::BXOR).u8(2).u8(2).u8(3);
+        b.u8(op::LOAD_INT).u8(1).i64(2);
+        b.u8(op::BSR).u8(2).u8(2).u8(1); // >> 2
+        b.u8(op::BNOT).u8(4).u8(2);
+        b.u8(op::BNOT).u8(4).u8(4); // double-not = identity
+        b.u8(op::RET).u8(4);
+        let m = one_fn_module(b.finish().unwrap(), 1, 5);
+        let fns = compile_module(&m, &[100, 101]).unwrap();
+        let addrs = load_exec(&fns, &helpers());
+        let f: extern "C" fn(u64) -> u64 = unsafe { core::mem::transmute(addrs[0]) };
+        let x: i64 = 0x3AB;
+        let expect = (((x & 0xFF) | 0x100) ^ (1 << 4)) >> 2;
+        assert_eq!(Term(f(Term::int(x).0)).as_int(), Some(expect));
     }
 
     #[test]

@@ -10,6 +10,7 @@ members = [
     "crates/ygg-jit",
     "tools/xtask",
     "tools/ygg-asm",
+    "tools/ygg-run",
 ]
 default-members = ["tools/xtask"]
 

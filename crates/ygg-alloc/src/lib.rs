@@ -30,7 +30,13 @@ impl<'a> FrameBitmap<'a> {
         assert!(storage.len() >= Self::storage_words(nframes));
         assert_eq!(base % FRAME_SIZE, 0);
         storage.fill(u64::MAX);
-        Self { bits: storage, base, nframes, cursor: 0, free: 0 }
+        Self {
+            bits: storage,
+            base,
+            nframes,
+            cursor: 0,
+            free: 0,
+        }
     }
 
     fn index_of(&self, addr: u64) -> usize {
@@ -133,7 +139,11 @@ impl<'a> FrameBitmap<'a> {
     pub fn free_frames(&mut self, addr: u64, n: usize) {
         let first = self.index_of(addr);
         for i in first..first + n {
-            assert!(self.is_used(i), "double free of frame {:#x}", self.addr_of(i));
+            assert!(
+                self.is_used(i),
+                "double free of frame {:#x}",
+                self.addr_of(i)
+            );
             self.set_used(i, false);
         }
     }

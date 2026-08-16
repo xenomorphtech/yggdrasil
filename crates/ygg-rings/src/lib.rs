@@ -46,7 +46,12 @@ impl ConstDefault for u8 {
     const DEFAULT: Self = 0;
 }
 impl ConstDefault for Sqe {
-    const DEFAULT: Self = Sqe { op: 0, tag: 0, arg0: 0, arg1: 0 };
+    const DEFAULT: Self = Sqe {
+        op: 0,
+        tag: 0,
+        arg0: 0,
+        arg1: 0,
+    };
 }
 impl ConstDefault for Cqe {
     const DEFAULT: Self = Cqe { tag: 0, result: 0 };
@@ -95,7 +100,9 @@ impl<T: Copy + Default, const N: usize> Ring<T, N> {
     }
 
     pub fn len(&self) -> usize {
-        self.tail.load(Ordering::Acquire).wrapping_sub(self.head.load(Ordering::Acquire)) as usize
+        self.tail
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.head.load(Ordering::Acquire)) as usize
     }
 
     pub fn is_empty(&self) -> bool {

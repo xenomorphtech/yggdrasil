@@ -58,7 +58,11 @@ pub fn load_with_engine(
     // The verifier is the isolation boundary: nothing unverified ever runs.
     ygg_bytecode::verify::verify(&module).map_err(LoadError::Verify)?;
     let atom_map: Vec<u32> = module.atoms.iter().map(|a| atoms::intern(a)).collect();
-    let jit = if use_jit { crate::jit::compile_and_publish(&module, &atom_map) } else { None };
+    let jit = if use_jit {
+        crate::jit::compile_and_publish(&module, &atom_map)
+    } else {
+        None
+    };
 
     let mut mods = MODULES.lock();
     let version = mods.get(name).map_or(1, |s| s.current.version + 1);
@@ -74,7 +78,13 @@ pub fn load_with_engine(
             slot.old = Some(core::mem::replace(&mut slot.current, loaded.clone()));
         }
         None => {
-            mods.insert(String::from(name), Slot { current: loaded.clone(), old: None });
+            mods.insert(
+                String::from(name),
+                Slot {
+                    current: loaded.clone(),
+                    old: None,
+                },
+            );
         }
     }
     log::info!(
@@ -117,25 +127,37 @@ pub fn current_process_module() -> Option<Arc<LoadedModule>> {
 /// Run a function of a loaded module under its best engine.
 pub fn invoke(m: &Arc<LoadedModule>, fn_idx: usize, args: &[Term]) -> Result<Term, Trap> {
     if let Some(jit) = &m.jit {
-        let addr = jit.fn_addrs[fn_idx];
-        let r = unsafe {
-            match args {
-                [] => core::mem::transmute::<u64, extern "C" fn() -> u64>(addr)(),
-                [a] => core::mem::transmute::<u64, extern "C" fn(u64) -> u64>(addr)(a.0),
-                [a, b] => {
-                    core::mem::transmute::<u64, extern "C" fn(u64, u64) -> u64>(addr)(a.0, b.0)
+        // Native fan-out for common arities; large-arity calls fall back to
+        // the interpreter (same semantics, no JIT ABI for arity > 16).
+        if args.len() <= 16 {
+            let addr = jit.fn_addrs[fn_idx];
+            let r = unsafe {
+                match args {
+                    [] => core::mem::transmute::<u64, extern "C" fn() -> u64>(addr)(),
+                    [a0] => core::mem::transmute::<u64, extern "C" fn(u64) -> u64>(addr)(a0.0),
+                    [a0, a1] => core::mem::transmute::<u64, extern "C" fn(u64, u64) -> u64>(addr)(a0.0, a1.0),
+                    [a0, a1, a2] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0),
+                    [a0, a1, a2, a3] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0),
+                    [a0, a1, a2, a3, a4] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0),
+                    [a0, a1, a2, a3, a4, a5] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0),
+                    [a0, a1, a2, a3, a4, a5, a6] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0, a6.0),
+                    [a0, a1, a2, a3, a4, a5, a6, a7] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0, a6.0, a7.0),
+                    [a0, a1, a2, a3, a4, a5, a6, a7, a8] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0, a6.0, a7.0, a8.0),
+                    [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0, a6.0, a7.0, a8.0, a9.0),
+                    [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0, a6.0, a7.0, a8.0, a9.0, a10.0),
+                    [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0, a6.0, a7.0, a8.0, a9.0, a10.0, a11.0),
+                    [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0, a6.0, a7.0, a8.0, a9.0, a10.0, a11.0, a12.0),
+                    [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0, a6.0, a7.0, a8.0, a9.0, a10.0, a11.0, a12.0, a13.0),
+                    [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0, a6.0, a7.0, a8.0, a9.0, a10.0, a11.0, a12.0, a13.0, a14.0),
+                    [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(addr)(a0.0, a1.0, a2.0, a3.0, a4.0, a5.0, a6.0, a7.0, a8.0, a9.0, a10.0, a11.0, a12.0, a13.0, a14.0, a15.0),
+                    _ => unreachable!(),
                 }
-                [a, b, c] => core::mem::transmute::<u64, extern "C" fn(u64, u64, u64) -> u64>(
-                    addr,
-                )(a.0, b.0, c.0),
-                _ => return Err(Trap::Badarg),
-            }
-        };
-        Ok(Term(r))
-    } else {
-        let mut api = KernelApi { module: m.clone() };
-        ygg_interp::run_function(&m.module, fn_idx, args, &mut api)
+            };
+            return Ok(Term(r));
+        }
     }
+    let mut api = KernelApi { module: m.clone() };
+    ygg_interp::run_function(&m.module, fn_idx, args, &mut api)
 }
 
 /// Resolve and run `module:fname(args)` against the *current* module table
@@ -216,7 +238,11 @@ pub fn spawn(module: Arc<LoadedModule>, fname: &str, arg: Term) -> Option<proc::
 
 pub fn spawn_fn(module: Arc<LoadedModule>, fn_idx: u32, arg: Term) -> proc::Pid {
     let (name, version) = (module.name.clone(), module.version);
-    let info = alloc::boxed::Box::new(SpawnInfo { module, fn_idx, arg });
+    let info = alloc::boxed::Box::new(SpawnInfo {
+        module,
+        fn_idx,
+        arg,
+    });
     let pid = proc::spawn(bytecode_entry, alloc::boxed::Box::into_raw(info) as u64);
     // Register the version at spawn time — a purge may race the first run.
     note_running(pid, &name, version);
@@ -273,7 +299,11 @@ impl SystemApi for KernelApi {
         proc::safepoint();
     }
     fn atom_global(&mut self, local: u32) -> u32 {
-        self.module.atom_map.get(local as usize).copied().unwrap_or_else(|| atoms::intern("?"))
+        self.module
+            .atom_map
+            .get(local as usize)
+            .copied()
+            .unwrap_or_else(|| atoms::intern("?"))
     }
     fn print(&mut self, t: Term) {
         print_term(t);
@@ -285,18 +315,37 @@ impl SystemApi for KernelApi {
         let id = port.as_port().ok_or(Trap::Badarg)?;
         let arg0 = arg0.as_int().ok_or(Trap::Badarg)?;
         let tag = tag.as_int().ok_or(Trap::Badarg)?;
-        let sqe = ygg_rings::Sqe { op: op as u32, tag, arg0: arg0 as u64, arg1: 0 };
-        if crate::ports::submit(id, sqe) { Ok(()) } else { Err(Trap::Badarg) }
+        let sqe = ygg_rings::Sqe {
+            op: op as u32,
+            tag,
+            arg0: arg0 as u64,
+            arg1: 0,
+        };
+        if crate::ports::submit(id, sqe) {
+            Ok(())
+        } else {
+            Err(Trap::Badarg)
+        }
+    }
+
+    fn buf_to_bin(&mut self, id: i64) -> Result<Term, Trap> {
+        let data = crate::ports::buf_take(id as u64).ok_or(Trap::Badarg)?;
+        proc::with_heap(|h| h.binary(&data)).map_err(|_| Trap::HeapFull)
+    }
+
+    fn bin_to_buf(&mut self, bin: Term) -> Result<Term, Trap> {
+        let data = unsafe {
+            if !bin.is_boxed() || bin.kind() != ygg_term::Kind::Binary {
+                return Err(Trap::Badarg);
+            }
+            bin.bin_bytes().to_vec()
+        };
+        Ok(Term::int(crate::ports::buf_create(data) as i64))
     }
 
     /// The hot-loading migration point: resolve module:fname in the *current*
     /// module table and run it (in that module's context).
-    fn call_ext(
-        &mut self,
-        module_atom: u32,
-        fname_atom: u32,
-        args: &[Term],
-    ) -> Result<Term, Trap> {
+    fn call_ext(&mut self, module_atom: u32, fname_atom: u32, args: &[Term]) -> Result<Term, Trap> {
         let r = call_ext_dynamic(module_atom, fname_atom, args);
         // Back in the caller's (this Api's) module version.
         note_running(proc::current(), &self.module.name, self.module.version);

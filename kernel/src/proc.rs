@@ -15,7 +15,7 @@
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 use ygg_term::{Heap, HeapFull, Term, copy_term};
@@ -25,7 +25,7 @@ use crate::atoms;
 pub type Pid = u64;
 
 /// Default process heap: 64 frames = 256 KiB (also the quota, until GC).
-const HEAP_PAGES: usize = 64;
+const DEFAULT_HEAP_PAGES: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
@@ -35,6 +35,43 @@ pub enum State {
     Dead,
 }
 
+/// A message in flight: deep-copied out of the sender into its own kernel-heap
+/// backing (BEAM's heap fragments). The receiver copies it into its heap at
+/// receive time — so no CPU ever writes another CPU's process heap.
+pub struct Fragment {
+    /// Stable backing store (the Vec buffer address never changes after build).
+    #[allow(dead_code)]
+    backing: alloc::vec::Vec<u64>,
+    root: Term,
+}
+
+unsafe impl Send for Fragment {}
+
+impl Fragment {
+    /// Deep-copy `term` (rooted in any live heap) into a fresh fragment.
+    fn copy_from(term: Term) -> Fragment {
+        let words = unsafe { ygg_term::term_size_words(term) }.max(1);
+        let mut backing = alloc::vec![0u64; words];
+        let mut heap = unsafe { Heap::new(backing.as_mut_ptr().cast(), words * 8) };
+        let root = unsafe { copy_term(term, &mut heap) }.expect("fragment sized exactly");
+        Fragment { backing, root }
+    }
+
+    /// Build a term directly in a fragment via `build` (retrying with a larger
+    /// backing if the builder outgrows it).
+    fn build(build: impl Fn(&mut Heap) -> Result<Term, HeapFull>) -> Fragment {
+        let mut words = 32usize;
+        loop {
+            let mut backing = alloc::vec![0u64; words];
+            let mut heap = unsafe { Heap::new(backing.as_mut_ptr().cast(), words * 8) };
+            match build(&mut heap) {
+                Ok(root) => return Fragment { backing, root },
+                Err(HeapFull) => words *= 2,
+            }
+        }
+    }
+}
+
 pub struct Process {
     pub state: State,
     /// Saved rsp while switched out.
@@ -42,7 +79,10 @@ pub struct Process {
     stack_slot: u64,
     heap: Heap,
     heap_span: u64,
-    mailbox: VecDeque<Term>,
+    heap_pages: usize,
+    mailbox: VecDeque<Fragment>,
+    /// Killed while Running on a core: honored at its next safepoint.
+    kill_pending: bool,
     /// Bidirectional links (exit-signal propagation).
     links: Vec<Pid>,
     /// (ref, watcher) pairs watching *this* process.
@@ -53,16 +93,10 @@ pub struct Process {
 type Table = BTreeMap<Pid, Box<Process>>;
 
 static TABLE: Mutex<Table> = Mutex::new(BTreeMap::new());
-static RUNQ: Mutex<VecDeque<Pid>> = Mutex::new(VecDeque::new());
 /// deadline tick -> pids to wake.
 static WHEEL: Mutex<BTreeMap<u64, Vec<Pid>>> = Mutex::new(BTreeMap::new());
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REF: AtomicU64 = AtomicU64::new(1);
-static CURRENT: AtomicU64 = AtomicU64::new(0);
-/// Scheduler context, saved when switching into a process.
-static SCHED_RSP: AtomicU64 = AtomicU64::new(0);
-/// Set by the timer interrupt; consumed by `safepoint`.
-pub static PREEMPT: AtomicBool = AtomicBool::new(false);
 
 mod ctx {
     /// Switch stacks: save callee-saved regs + rsp to `*save`, resume `new_rsp`.
@@ -102,23 +136,66 @@ mod ctx {
 }
 
 pub fn current() -> Pid {
-    CURRENT.load(Ordering::Relaxed)
+    crate::percpu::cpu().current.load(Ordering::Relaxed)
+}
+
+/// Queue a process as runnable on this core; kick one idle core so it can
+/// steal without waiting for its next timer tick.
+fn enqueue(pid: Pid) {
+    let me = crate::percpu::cpu();
+    me.runq.lock().push_back(pid);
+    for c in crate::percpu::all() {
+        if c.id != me.id && c.idle.load(Ordering::Relaxed) {
+            let lapic = c.lapic_id.load(Ordering::Acquire);
+            if lapic != u32::MAX {
+                crate::irq::ipi(lapic, crate::irq::WAKE_VECTOR);
+            }
+            break;
+        }
+    }
 }
 
 pub fn is_alive(pid: Pid) -> bool {
-    TABLE.lock().get(&pid).is_some_and(|p| p.state != State::Dead)
+    TABLE
+        .lock()
+        .get(&pid)
+        .is_some_and(|p| p.state != State::Dead)
 }
 
 pub fn spawn(entry: extern "C" fn(u64), arg: u64) -> Pid {
-    spawn_inner(entry, arg, None)
+    spawn_inner(entry, arg, None, DEFAULT_HEAP_PAGES)
+}
+
+/// Spawn with a custom heap size (pages). Heavy term churn (e.g. the network
+/// stack) needs more than the default quota until per-process GC lands.
+pub fn spawn_with_heap(entry: extern "C" fn(u64), arg: u64, heap_pages: usize) -> Pid {
+    spawn_inner(entry, arg, None, heap_pages)
 }
 
 /// Spawn and atomically link to the current process.
 pub fn spawn_link(entry: extern "C" fn(u64), arg: u64) -> Pid {
-    spawn_inner(entry, arg, Some(current()))
+    spawn_inner(entry, arg, Some(current()), DEFAULT_HEAP_PAGES)
 }
 
-fn spawn_inner(entry: extern "C" fn(u64), arg: u64, link_to: Option<Pid>) -> Pid {
+/// Spawn and atomically monitor: the monitor is registered before the child
+/// can run (on any core), so the DOWN reason is never `noproc`.
+pub fn spawn_monitor(entry: extern "C" fn(u64), arg: u64) -> (Pid, u64) {
+    let r = NEXT_REF.fetch_add(1, Ordering::Relaxed);
+    MONITOR_AT_SPAWN.lock().replace((r, current()));
+    let pid = spawn_inner(entry, arg, None, DEFAULT_HEAP_PAGES);
+    (pid, r)
+}
+
+/// Plumbing for `spawn_monitor` (set under no lock ordering constraints,
+/// consumed inside `spawn_inner`'s table insertion).
+static MONITOR_AT_SPAWN: Mutex<Option<(u64, Pid)>> = Mutex::new(None);
+
+fn spawn_inner(
+    entry: extern "C" fn(u64),
+    arg: u64,
+    link_to: Option<Pid>,
+    heap_pages: usize,
+) -> Pid {
     let (slot, top) = crate::vmm::map_stack();
     // Seed the stack so ctx::switch pops into the trampoline.
     // Layout from final rsp: [r15][r14][r13][r12=arg][rbx=entry][rbp][ret=trampoline]
@@ -134,11 +211,12 @@ fn spawn_inner(entry: extern "C" fn(u64), arg: u64, link_to: Option<Pid>) -> Pid
         p.add(6).write(ctx::trampoline as usize as u64);
     }
 
-    let span = crate::mm::alloc_contig(HEAP_PAGES, 1).expect("no frames for process heap");
-    let heap = unsafe { Heap::new(crate::mm::phys_to_virt(span), HEAP_PAGES * 4096) };
+    let span = crate::mm::alloc_contig(heap_pages, 1).expect("no frames for process heap");
+    let heap = unsafe { Heap::new(crate::mm::phys_to_virt(span), heap_pages * 4096) };
 
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let mut links = Vec::new();
+    let monitors: Vec<(u64, Pid)> = MONITOR_AT_SPAWN.lock().take().into_iter().collect();
     {
         let mut t = TABLE.lock();
         if let Some(parent) = link_to {
@@ -155,14 +233,16 @@ fn spawn_inner(entry: extern "C" fn(u64), arg: u64, link_to: Option<Pid>) -> Pid
                 stack_slot: slot,
                 heap,
                 heap_span: span,
+                heap_pages,
                 mailbox: VecDeque::new(),
+                kill_pending: false,
                 links,
-                monitors: Vec::new(),
+                monitors,
                 exit_reason: "normal",
             }),
         );
     }
-    RUNQ.lock().push_back(pid);
+    enqueue(pid);
     pid
 }
 
@@ -185,14 +265,14 @@ pub fn with_heap<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
     f(&mut t.get_mut(&pid).expect("no current process").heap)
 }
 
-/// Raw pointer to the current process's heap, for the execution engine.
+/// Raw pointer to the current process's heap, for the execution engines.
 ///
-/// Sound on single-core cooperative scheduling: only the running process (or
-/// copy-on-send under the table lock while it's switched *out*) touches it.
+/// Lock-free: set by this core's scheduler at switch-in, cleared at
+/// switch-out. Only the owning (running) process ever writes through it.
 pub fn current_heap_ptr() -> *mut Heap {
-    let pid = current();
-    let mut t = TABLE.lock();
-    &raw mut t.get_mut(&pid).expect("no current process").heap
+    let p = crate::percpu::cpu().current_heap.load(Ordering::Relaxed);
+    debug_assert!(p != 0, "no current process heap");
+    p as *mut Heap
 }
 
 /// Build a term or die of quota breach.
@@ -203,33 +283,31 @@ pub fn build(f: impl FnOnce(&mut Heap) -> Result<Term, HeapFull>) -> Term {
     }
 }
 
-/// Switch from the current process back to the scheduler.
+/// Switch from the current process back to this core's scheduler.
 fn switch_to_scheduler(save: *mut u64) {
-    unsafe { ctx::switch(save, SCHED_RSP.load(Ordering::Relaxed)) }
+    let rsp = crate::percpu::cpu().sched_rsp.load(Ordering::Relaxed);
+    unsafe { ctx::switch(save, rsp) }
 }
 
 pub fn yield_now() {
     let pid = current();
     debug_assert!(pid != 0, "yield outside a process");
-    let (rsp_ptr, requeue) = {
+    let rsp_ptr = {
         let mut t = TABLE.lock();
         let p = t.get_mut(&pid).unwrap();
-        // Someone may have killed us since our last safepoint: stay Dead and
-        // let the scheduler reap us (mark_dead already queued the pid).
-        if p.state != State::Dead {
-            p.state = State::Runnable;
-        }
-        (&raw mut p.rsp, p.state == State::Runnable)
+        &raw mut p.rsp
     };
-    if requeue {
-        RUNQ.lock().push_back(pid);
-    }
+    // State stays Running until our scheduler has saved this context; it
+    // requeues us afterwards (another core must never resume a stale rsp).
+    crate::percpu::cpu()
+        .post_switch
+        .store(pid << 2 | 1, Ordering::Relaxed);
     switch_to_scheduler(rsp_ptr);
 }
 
 /// Interpreter back-edge / native-body poll point.
 pub fn safepoint() {
-    if PREEMPT.swap(false, Ordering::Relaxed) && current() != 0 {
+    if crate::percpu::cpu().preempt.swap(false, Ordering::Relaxed) && current() != 0 {
         yield_now();
     }
 }
@@ -275,69 +353,58 @@ pub fn kill(pid: Pid, reason: &'static str) {
 
 fn mark_dead(t: &mut Table, pid: Pid, reason: &'static str) {
     if let Some(p) = t.get_mut(&pid) {
-        if p.state != State::Dead {
-            // Marking the *current* process works too: it keeps running until
-            // its next safepoint/receive, which refuses to resurrect it.
-            p.state = State::Dead;
-            p.exit_reason = reason;
-            // Dead processes are reaped when popped from the run queue.
-            RUNQ.lock().push_back(pid);
+        match p.state {
+            State::Dead => {}
+            // Running (possibly on another core): never reap under its feet.
+            // Flag it; the process turns Dead at its next safepoint/receive
+            // and is reaped by its own core's scheduler.
+            State::Running => {
+                if !p.kill_pending {
+                    p.kill_pending = true;
+                    p.exit_reason = reason;
+                }
+            }
+            State::Runnable | State::Waiting => {
+                p.state = State::Dead;
+                p.exit_reason = reason;
+                // Reaped when popped from a run queue.
+                enqueue(pid);
+            }
         }
     }
 }
 
-/// Copy `msg` (rooted in the sender's heap) into `to`'s heap and enqueue it.
-/// Returns false if the target is gone. A receiver whose heap can't hold the
-/// message dies of quota breach (no GC yet to save it).
+/// Copy `msg` (rooted in the sender's heap) into a fragment and enqueue it.
+/// Returns false if the target is gone. The receiver copies it into its own
+/// heap at receive time (and dies of quota breach there if it can't).
 pub fn send(to: Pid, msg: Term) -> bool {
+    // Copy before taking the table lock: only the sender's heap is read.
+    let frag = Fragment::copy_from(msg);
     let mut t = TABLE.lock();
-    send_locked(&mut t, to, msg)
+    deliver_fragment(&mut t, to, frag)
 }
 
-fn send_locked(t: &mut Table, to: Pid, msg: Term) -> bool {
-    let Some(p) = t.get_mut(&to) else { return false };
+fn deliver_fragment(t: &mut Table, to: Pid, frag: Fragment) -> bool {
+    let Some(p) = t.get_mut(&to) else {
+        return false;
+    };
     if p.state == State::Dead {
         return false;
     }
-    match unsafe { copy_term(msg, &mut p.heap) } {
-        Ok(copied) => {
-            p.mailbox.push_back(copied);
-            if p.state == State::Waiting {
-                p.state = State::Runnable;
-                RUNQ.lock().push_back(to);
-            }
-            true
-        }
-        Err(HeapFull) => {
-            mark_dead(t, to, "heap quota exceeded (mailbox overflow)");
-            false
-        }
+    p.mailbox.push_back(frag);
+    if p.state == State::Waiting {
+        p.state = State::Runnable;
+        enqueue(to);
     }
+    true
 }
 
-/// Build a message directly in `to`'s heap and enqueue it (kernel-side
-/// senders: DOWN messages, port completions). Returns false if the target is
-/// gone; a target whose heap is full dies of quota breach.
-pub fn send_built(to: Pid, build: impl FnOnce(&mut Heap) -> Result<Term, HeapFull>) -> bool {
+/// Build a message in a fragment and enqueue it (kernel-side senders: DOWN
+/// messages, port completions). Returns false if the target is gone.
+pub fn send_built(to: Pid, build: impl Fn(&mut Heap) -> Result<Term, HeapFull>) -> bool {
+    let frag = Fragment::build(build);
     let mut t = TABLE.lock();
-    let Some(p) = t.get_mut(&to) else { return false };
-    if p.state == State::Dead {
-        return false;
-    }
-    match build(&mut p.heap) {
-        Ok(m) => {
-            p.mailbox.push_back(m);
-            if p.state == State::Waiting {
-                p.state = State::Runnable;
-                RUNQ.lock().push_back(to);
-            }
-            true
-        }
-        Err(HeapFull) => {
-            mark_dead(&mut t, to, "heap quota exceeded (mailbox overflow)");
-            false
-        }
-    }
+    deliver_fragment(&mut t, to, frag)
 }
 
 /// Selective receive: return the first mailbox message satisfying `pred`,
@@ -349,6 +416,9 @@ pub fn recv_where(pred: impl Fn(Term) -> bool, timeout_ms: Option<u64>) -> Optio
         let rsp_ptr = {
             let mut t = TABLE.lock();
             let p = t.get_mut(&pid).unwrap();
+            if p.kill_pending {
+                p.state = State::Dead;
+            }
             if p.state == State::Dead {
                 // Killed since our last safepoint: don't take a message, just
                 // hand control back so the scheduler reaps us.
@@ -357,22 +427,49 @@ pub fn recv_where(pred: impl Fn(Term) -> bool, timeout_ms: Option<u64>) -> Optio
                 switch_to_scheduler(ptr);
                 unreachable!("dead process rescheduled");
             }
-            if let Some(i) = p.mailbox.iter().position(|&m| pred(m)) {
-                return p.mailbox.remove(i);
+            // Copy each candidate into our heap speculatively; roll the bump
+            // pointer back on predicate miss (nothing else allocates between).
+            let mut quota_death = false;
+            let mut matched: Option<Term> = None;
+            for i in 0..p.mailbox.len() {
+                let watermark = p.heap.used_bytes();
+                let copied = match unsafe { copy_term(p.mailbox[i].root, &mut p.heap) } {
+                    Ok(c) => c,
+                    Err(HeapFull) => {
+                        quota_death = true;
+                        break;
+                    }
+                };
+                if pred(copied) {
+                    p.mailbox.remove(i);
+                    matched = Some(copied);
+                    break;
+                }
+                p.heap.truncate_to(watermark);
+            }
+            if quota_death {
+                drop(t);
+                exit("heap quota exceeded");
+            }
+            if matched.is_some() {
+                return matched;
             }
             if let Some(d) = deadline
                 && crate::irq::ticks() >= d
             {
                 return None;
             }
-            p.state = State::Waiting;
             &raw mut p.rsp
         };
         if let Some(d) = deadline {
             WHEEL.lock().entry(d).or_default().push(pid);
         }
-        // A send() (or wheel wake) between unlock and switch re-queues us —
-        // single core, no lost wakeup.
+        // State stays Running until our scheduler saved the context; it then
+        // transitions us to Waiting (or straight back to Runnable if a
+        // message raced in) — no lost wakeups, no stale-context steals.
+        crate::percpu::cpu()
+            .post_switch
+            .store(pid << 2 | 2, Ordering::Relaxed);
         switch_to_scheduler(rsp_ptr);
     }
 }
@@ -402,26 +499,56 @@ fn check_wheel() {
     if !due.is_empty() {
         let mut t = TABLE.lock();
         for pid in due {
-            if let Some(p) = t.get_mut(&pid) {
-                if p.state == State::Waiting {
+            match t.get_mut(&pid) {
+                Some(p) if p.state == State::Waiting => {
                     p.state = State::Runnable;
-                    RUNQ.lock().push_back(pid);
+                    enqueue(pid);
                 }
+                // Caught mid block-transition on another core: try next tick.
+                Some(p) if p.state == State::Running => {
+                    WHEEL.lock().entry(now + 1).or_default().push(pid);
+                }
+                _ => {}
             }
         }
     }
 }
 
-/// The scheduler loop. Runs on the boot stack; never returns.
+/// The scheduler loop for this core. Never returns.
 pub fn run() -> ! {
+    let me = crate::percpu::cpu();
     loop {
-        check_wheel();
+        // Contexts don't carry rflags: after e.g. a guard-page kill we resume
+        // here with IF=0. The scheduler always runs with interrupts on.
+        x86_64::instructions::interrupts::enable();
+        me.phase.store(1, Ordering::Relaxed);
+        // The timer wheel is time-driven and TICKS is BSP-owned.
+        if me.id == 0 {
+            check_wheel();
+        }
+        me.phase.store(2, Ordering::Relaxed);
         crate::ports::pump();
-        let Some(pid) = RUNQ.lock().pop_front() else {
-            // Nothing runnable: wait for an interrupt to change that.
+        me.phase.store(3, Ordering::Relaxed);
+        // NOTE: pop and steal must be separate statements — holding our own
+        // runq guard while locking another core's runq deadlocks the moment
+        // two cores steal from each other.
+        let mut next = me.runq.lock().pop_front();
+        if next.is_none() {
+            // Steal from the back of another core's queue.
+            next = crate::percpu::all()
+                .iter()
+                .filter(|c| c.id != me.id)
+                .find_map(|c| c.runq.lock().pop_back());
+        }
+        let Some(pid) = next else {
+            // Nothing runnable anywhere: sleep until an interrupt (timer or
+            // wake IPI) changes that.
+            me.idle.store(true, Ordering::Relaxed);
             x86_64::instructions::interrupts::enable_and_hlt();
+            me.idle.store(false, Ordering::Relaxed);
             continue;
         };
+        me.phase.store(4, Ordering::Relaxed);
         let rsp = {
             let mut t = TABLE.lock();
             match t.get_mut(&pid) {
@@ -430,28 +557,101 @@ pub fn run() -> ! {
                     p.rsp
                 }
                 Some(p) if p.state == State::Dead => {
-                    reap(&mut t, pid);
+                    let fin = reap(&mut t, pid);
+                    drop(t);
+                    finalize(fin);
                     continue;
                 }
                 // Stale queue entry (waiting/duplicate/gone): skip.
                 _ => continue,
             }
         };
-        CURRENT.store(pid, Ordering::Relaxed);
-        unsafe { ctx::switch(SCHED_RSP.as_ptr(), rsp) };
-        CURRENT.store(0, Ordering::Relaxed);
+        let heap_ptr = {
+            let mut t = TABLE.lock();
+            &raw mut t.get_mut(&pid).unwrap().heap as u64
+        };
+        me.phase.store(5, Ordering::Relaxed);
+        me.current.store(pid, Ordering::Relaxed);
+        me.current_heap.store(heap_ptr, Ordering::Relaxed);
+        me.switches.fetch_add(1, Ordering::Relaxed);
+        unsafe { ctx::switch(me.sched_rsp.as_ptr(), rsp) };
+        // The context we resumed from may have had IF=0 (e.g. the process was
+        // killed inside the page-fault handler). Everything below may spin on
+        // cross-core protocols (TLB shootdown) that need our interrupts on.
+        x86_64::instructions::interrupts::enable();
+        me.current.store(0, Ordering::Relaxed);
+        me.current_heap.store(0, Ordering::Relaxed);
 
+        me.phase.store(6, Ordering::Relaxed);
+        // The outgoing context is fully saved now: perform its deferred
+        // transition, then reap if it ended up Dead.
+        let action = me.post_switch.swap(0, Ordering::Relaxed);
         let mut t = TABLE.lock();
+        match (action & 3, action >> 2) {
+            (1, apid) => {
+                debug_assert_eq!(apid, pid);
+                if let Some(p) = t.get_mut(&apid) {
+                    if p.kill_pending {
+                        p.state = State::Dead;
+                    }
+                    if p.state == State::Running {
+                        p.state = State::Runnable;
+                        enqueue(apid);
+                    }
+                }
+            }
+            (2, apid) => {
+                debug_assert_eq!(apid, pid);
+                if let Some(p) = t.get_mut(&apid) {
+                    if p.kill_pending {
+                        p.state = State::Dead;
+                    }
+                    if p.state == State::Running {
+                        if p.mailbox.is_empty() {
+                            p.state = State::Waiting;
+                        } else {
+                            // A message raced in while we were switching.
+                            p.state = State::Runnable;
+                            enqueue(apid);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
         if t.get(&pid).is_some_and(|p| p.state == State::Dead) {
-            reap(&mut t, pid);
+            me.phase.store(7, Ordering::Relaxed);
+            let fin = reap(&mut t, pid);
+            drop(t);
+            finalize(fin);
         }
     }
+}
+
+/// Resources released outside the TABLE lock (see `reap`).
+struct Finalize {
+    pid: Pid,
+    stack_slot: u64,
+    heap_span: u64,
+    heap_pages: usize,
+}
+
+/// Free a dead process's resources. MUST run with the TABLE lock dropped:
+/// port teardown takes PORTS (pump orders PORTS -> TABLE) and stack unmap
+/// broadcasts a TLB shootdown that must not stall other cores against TABLE.
+fn finalize(fin: Finalize) {
+    crate::vmm::unmap_stack(fin.stack_slot);
+    crate::mm::free_frames(fin.heap_span, fin.heap_pages);
+    crate::ports::close_owned_by(fin.pid);
 }
 
 /// Free a dead process and deliver its exit signals: DOWN messages to
 /// monitors, death to links. Link propagation is hop-by-hop: linked processes
 /// are marked dead here and their own reap continues the cascade.
-fn reap(t: &mut Table, pid: Pid) {
+/// Remove a dead process and deliver its exit signals (monitors, links) under
+/// the TABLE lock. Resource teardown is returned for `finalize` — running it
+/// here would invert the PORTS->TABLE lock order pump relies on.
+fn reap(t: &mut Table, pid: Pid) -> Finalize {
     let p = t.remove(&pid).unwrap();
     log::info!("[proc] pid {} exited: {}", pid, p.exit_reason);
 
@@ -464,32 +664,24 @@ fn reap(t: &mut Table, pid: Pid) {
         }
     }
 
-    crate::vmm::unmap_stack(p.stack_slot);
-    crate::mm::free_frames(p.heap_span, HEAP_PAGES);
-    crate::ports::close_owned_by(pid);
+    Finalize {
+        pid,
+        stack_slot: p.stack_slot,
+        heap_span: p.heap_span,
+        heap_pages: p.heap_pages,
+    }
 }
 
 fn deliver_down(t: &mut Table, watcher: Pid, r: u64, dead: Pid, reason: &'static str) {
     let down = atoms::intern("DOWN");
     let reason = atoms::intern(reason);
-    let Some(w) = t.get_mut(&watcher) else { return };
-    if w.state == State::Dead {
-        return;
-    }
-    let msg = w.heap.tuple(&[
-        Term::atom(down),
-        Term::reference(r),
-        Term::pid(dead),
-        Term::atom(reason),
-    ]);
-    match msg {
-        Ok(m) => {
-            w.mailbox.push_back(m);
-            if w.state == State::Waiting {
-                w.state = State::Runnable;
-                RUNQ.lock().push_back(watcher);
-            }
-        }
-        Err(HeapFull) => mark_dead(t, watcher, "heap quota exceeded (mailbox overflow)"),
-    }
+    let frag = Fragment::build(|h| {
+        h.tuple(&[
+            Term::atom(down),
+            Term::reference(r),
+            Term::pid(dead),
+            Term::atom(reason),
+        ])
+    });
+    deliver_fragment(t, watcher, frag);
 }

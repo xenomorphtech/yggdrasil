@@ -106,10 +106,20 @@ fn build_modules(root: &Path) -> Result<Vec<PathBuf>> {
     for entry in std::fs::read_dir(root.join("modules"))? {
         let path = entry?.path();
         if path.extension().is_some_and(|e| e == "yasm") {
-            let out = out_dir.join(path.file_stem().unwrap()).with_extension("yggm");
+            let out = out_dir
+                .join(path.file_stem().unwrap())
+                .with_extension("yggm");
             sh(
                 "cargo",
-                &["run", "-q", "-p", "ygg-asm", "--", path.to_str().unwrap(), out.to_str().unwrap()],
+                &[
+                    "run",
+                    "-q",
+                    "-p",
+                    "ygg-asm",
+                    "--",
+                    path.to_str().unwrap(),
+                    out.to_str().unwrap(),
+                ],
             )?;
             outs.push(out);
         }
@@ -117,9 +127,70 @@ fn build_modules(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(outs)
 }
 
+/// Compile the Lux TCP/IP stack (sibling checkout) to Yggdrasil modules and
+/// pack them into one blob the kernel can load:
+/// `LUXPK1\n [u32 entry_len][entry][u32 count] count*([u32 nlen][name][u32 dlen][data])`.
+fn build_luxpack(root: &Path) -> Result<PathBuf> {
+    let lux_root = root.parent().unwrap().join("lux");
+    let status = Command::new("cargo")
+        .args(["run", "-q", "--", "--yggdrasil", "examples/tcp_ip.lux"])
+        .current_dir(&lux_root)
+        .status()
+        .context("running the lux compiler (needs ../lux checkout)")?;
+    ensure!(status.success(), "lux --yggdrasil failed");
+
+    let artifacts = lux_root.join("target/lux/artifacts");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifacts.join("tcp_ip.ygg.json"))?)?;
+    let entry = manifest["entry"]["module"]
+        .as_str()
+        .context("manifest has no entry module")?;
+    let modules = manifest["modules"].as_array().context("manifest has no modules")?;
+
+    let mut pack: Vec<u8> = b"LUXPK1\n".to_vec();
+    pack.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+    pack.extend_from_slice(entry.as_bytes());
+    pack.extend_from_slice(&(modules.len() as u32).to_le_bytes());
+    for m in modules {
+        let name = m["name"].as_str().context("module without name")?;
+        let file = m["file"].as_str().context("module without file")?;
+        let data = std::fs::read(artifacts.join(file))?;
+        pack.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        pack.extend_from_slice(name.as_bytes());
+        pack.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        pack.extend_from_slice(&data);
+    }
+    // Alias table (appended; older readers ignore trailing bytes):
+    // u32 count, count * (u32 len, source_name, u32 len, module_hash).
+    // Lets the kernel resolve entry points like `input`/`tcp_send` by name.
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifacts.join("tcp_ip.meta.json"))?)?;
+    let functions = meta["functions"].as_array().context("meta has no functions")?;
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    for f in functions {
+        if let (Some(name), Some(module)) = (f["source_name"].as_str(), f["module"].as_str()) {
+            aliases.push((name.to_string(), module.to_string()));
+        }
+    }
+    pack.extend_from_slice(&(aliases.len() as u32).to_le_bytes());
+    for (name, module) in &aliases {
+        pack.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        pack.extend_from_slice(name.as_bytes());
+        pack.extend_from_slice(&(module.len() as u32).to_le_bytes());
+        pack.extend_from_slice(module.as_bytes());
+    }
+
+    let out = root.join("build/tcp_ip.luxpack");
+    std::fs::create_dir_all(out.parent().unwrap())?;
+    std::fs::write(&out, pack)?;
+    println!("luxpack: {} modules, {} aliases, entry {entry}", modules.len(), aliases.len());
+    Ok(out)
+}
+
 fn make_iso(root: &Path, cmdline: &str) -> Result<PathBuf> {
     let kernel = build_kernel()?;
     let modules = build_modules(root)?;
+    let luxpack = build_luxpack(root)?;
     let limine_dir = ensure_limine(root)?;
 
     let iso_root = root.join("build/iso_root");
@@ -131,7 +202,9 @@ fn make_iso(root: &Path, cmdline: &str) -> Result<PathBuf> {
 
     std::fs::copy(&kernel, boot.join("yggdrasil"))?;
 
-    let mut conf = String::from("timeout: 0\n\n/Yggdrasil\n    protocol: limine\n    path: boot():/boot/yggdrasil\n");
+    let mut conf = String::from(
+        "timeout: 0\n\n/Yggdrasil\n    protocol: limine\n    path: boot():/boot/yggdrasil\n",
+    );
     if !cmdline.is_empty() {
         conf.push_str(&format!("    cmdline: {cmdline}\n"));
     }
@@ -145,9 +218,15 @@ fn make_iso(root: &Path, cmdline: &str) -> Result<PathBuf> {
         std::fs::copy(m, boot.join(name))?;
         conf.push_str(&format!("    module_path: boot():/boot/{name}\n"));
     }
+    std::fs::copy(&luxpack, boot.join("tcp_ip.luxpack"))?;
+    conf.push_str("    module_path: boot():/boot/tcp_ip.luxpack\n");
     std::fs::write(boot.join("limine/limine.conf"), conf)?;
 
-    for f in ["limine-bios.sys", "limine-bios-cd.bin", "limine-uefi-cd.bin"] {
+    for f in [
+        "limine-bios.sys",
+        "limine-bios-cd.bin",
+        "limine-uefi-cd.bin",
+    ] {
         std::fs::copy(limine_dir.join(f), boot.join("limine").join(f))?;
     }
     for f in ["BOOTX64.EFI", "BOOTIA32.EFI"] {
@@ -204,8 +283,8 @@ fn ensure_disk(root: &Path) -> Result<PathBuf> {
 /// the kernel loads it from there at runtime through the storage port.
 fn embed_hotmod(root: &Path) -> Result<()> {
     use std::io::{Seek, SeekFrom, Write};
-    let module = std::fs::read(root.join("build/modules/hotmod.yggm"))
-        .context("hotmod.yggm not built")?;
+    let module =
+        std::fs::read(root.join("build/modules/hotmod.yggm")).context("hotmod.yggm not built")?;
     let disk = ensure_disk(root)?;
     let mut img = std::fs::OpenOptions::new().write(true).open(&disk)?;
     img.seek(SeekFrom::Start(2048 * 512))?;
@@ -223,6 +302,8 @@ fn qemu_command(root: &Path, iso: &Path, capture: bool) -> Result<Command> {
         "q35",
         "-cpu",
         "qemu64,+x2apic",
+        "-smp",
+        "4",
         "-m",
         "512M",
         "-cdrom",
@@ -239,7 +320,7 @@ fn qemu_command(root: &Path, iso: &Path, capture: bool) -> Result<Command> {
         "-device",
         "virtio-blk-pci,drive=d0",
         "-netdev",
-        "user,id=n0",
+        "user,id=n0,hostfwd=tcp:127.0.0.1:17799-:7",
         "-device",
         "virtio-net-pci,netdev=n0",
         "-object",
@@ -270,7 +351,9 @@ fn test(root: &Path) -> Result<()> {
     let iso = make_iso(root, "selftest")?;
     embed_hotmod(root)?;
 
-    let mut child = qemu_command(root, &iso, true)?.spawn().context("spawning qemu")?;
+    let mut child = qemu_command(root, &iso, true)?
+        .spawn()
+        .context("spawning qemu")?;
     let mut stdout = child.stdout.take().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
@@ -287,18 +370,38 @@ fn test(root: &Path) -> Result<()> {
         })
     };
 
-    // Drive the interactive part: when the bytecode echo server says it's
-    // ready, type PING at it over the (virtual) serial line.
+    // Drive the interactive parts:
+    //  1. when the Lux TCP adapter listens, connect through slirp's hostfwd
+    //     and expect our bytes echoed back by the Lux stack;
+    //  2. when the bytecode serial echo server says it's ready, type PING.
     let mut typed = false;
+    let mut tcp_thread: Option<std::thread::JoinHandle<Result<()>>> = None;
     let start = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if !typed {
+        {
             let snapshot = captured.lock().unwrap().clone();
-            if String::from_utf8_lossy(&snapshot).contains("[bc] echo_ready") {
-                stdin.write_all(b"PING\n").context("typing into qemu serial")?;
+            let text = String::from_utf8_lossy(&snapshot).into_owned();
+            if tcp_thread.is_none() && text.contains("[tcp] listening") {
+                tcp_thread = Some(std::thread::spawn(|| {
+                    use std::io::{Read as _, Write as _};
+                    let mut s = std::net::TcpStream::connect(("127.0.0.1", 17799))
+                        .context("connecting to hostfwd")?;
+                    s.set_read_timeout(Some(Duration::from_secs(30)))?;
+                    s.write_all(b"PING-TCP")?;
+                    let mut buf = [0u8; 8];
+                    s.read_exact(&mut buf).context("reading echo")?;
+                    ensure!(&buf == b"PING-TCP", "echo mismatch: {buf:?}");
+                    println!("host tcp client: echo verified");
+                    Ok(())
+                }));
+            }
+            if !typed && text.contains("[bc] echo_ready") {
+                stdin
+                    .write_all(b"PING\n")
+                    .context("typing into qemu serial")?;
                 stdin.flush()?;
                 typed = true;
             }
@@ -314,6 +417,13 @@ fn test(root: &Path) -> Result<()> {
     };
     reader.join().unwrap();
     let transcript = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+    match tcp_thread {
+        Some(t) => t.join().unwrap().context("host-side tcp echo failed")?,
+        None => {
+            println!("--- serial transcript ---\n{transcript}-------------------------");
+            bail!("the Lux TCP adapter never announced it was listening");
+        }
+    }
     println!("--- serial transcript ---\n{transcript}-------------------------");
 
     let code = status.code().context("qemu killed by signal")?;
@@ -323,6 +433,7 @@ fn test(root: &Path) -> Result<()> {
     );
     let markers: &[&str] = &[
         "Yggdrasil",
+        "[smp] 4 cpus online",
         "[ok] limine requests answered",
         "[ok] int3 dispatched and recovered",
         "[ok] pmm alloc/free/contig",
@@ -332,6 +443,9 @@ fn test(root: &Path) -> Result<()> {
         "[ok] process ping-pong (5 rounds)",
         "[ok] preemptive scheduling (two non-yielding busy loops both advanced)",
         "[ok] stack overflow killed only the offender",
+        "[ok] smp: two cores executed simultaneously",
+        "[ok] smp: work stealing spread load across cpus",
+        "[ok] smp: 200-process churn with TLB shootdown",
         "[ok] terms: build/copy-on-send/eq/format",
         "[ok] supervisor: 3 restarts via DOWN messages",
         "[ok] exit propagation over links (parent died with child's reason)",
@@ -344,6 +458,8 @@ fn test(root: &Path) -> Result<()> {
         "[ok] module loaded at runtime from the storage port and spawned",
         "[ok] hot upgrade v1->v2: state retained, new format, purge killed the holdout",
         "[ok] differential: interpreter and Cranelift JIT agree on mathmod",
+        "[ok] lux tcp/ip stack: full protocol suite passed on yggdrasil",
+        "[ok] lux tcp stack served a real host connection (SYN->echo)",
         "[bc] 101",
         "[bc] 105",
         "[ok] bytecode ping-pong under interpreter (busy loop preempted at back-edges)",
@@ -359,7 +475,8 @@ fn test(root: &Path) -> Result<()> {
     // which truncates the pcap when QEMU restarts.
     let pcap = std::fs::read(root.join("build/net.pcap")).context("reading net.pcap")?;
     ensure!(
-        pcap.windows(b"YGG-NET-OK".len()).any(|w| w == b"YGG-NET-OK"),
+        pcap.windows(b"YGG-NET-OK".len())
+            .any(|w| w == b"YGG-NET-OK"),
         "UDP payload not found in pcap"
     );
 

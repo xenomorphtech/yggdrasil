@@ -10,7 +10,7 @@ use ygg_alloc::FRAME_SIZE;
 
 use ygg_term::Term;
 
-use crate::{atoms, boot, idt, irq, mm, proc, println};
+use crate::{atoms, boot, idt, irq, mm, println, proc};
 
 /// Pre-scheduler tests, run from the boot context.
 pub fn early() {
@@ -29,6 +29,9 @@ pub extern "C" fn proc_tests(_arg: u64) {
     ping_pong();
     preemption();
     stack_overflow();
+    smp_parallelism();
+    smp_stealing();
+    smp_churn();
     terms_in_kernel();
     supervisor();
     link_propagation();
@@ -41,6 +44,8 @@ pub extern "C" fn proc_tests(_arg: u64) {
     runtime_module_load();
     hot_code_loading();
     differential_engines();
+    lux_tcp_stack();
+    lux_tcp_echo_live();
     bytecode();
     serial_port_echo();
     println!("[selftest] all passed");
@@ -122,6 +127,113 @@ fn stack_overflow() {
     println!("[ok] stack overflow killed only the offender");
 }
 
+// ---- M9: SMP ----
+
+static SPIN_FLAG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SPIN_PROGRESS: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn spinner_no_safepoints(_arg: u64) {
+    // Deliberately no safepoints: this process can never be preempted. It can
+    // only make progress if another core runs it while its parent also runs.
+    while !SPIN_FLAG.load(Ordering::Acquire) {
+        SPIN_PROGRESS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Proves simultaneous execution: the parent busy-waits (no yielding) while
+/// the un-preemptible spinner advances — impossible on one core.
+fn smp_parallelism() {
+    assert!(crate::percpu::count() >= 2, "suite requires -smp 2");
+    let p = proc::spawn(spinner_no_safepoints, 0);
+    let start = irq::ticks();
+    while SPIN_PROGRESS.load(Ordering::Relaxed) == 0 {
+        if irq::ticks() - start >= 10_000 {
+            let mut snap = alloc::string::String::new();
+            use core::fmt::Write;
+            for c in crate::percpu::all() {
+                let _ = write!(
+                    snap,
+                    "cpu{}: cur={} q={} idle={} phase={} sw={} | ",
+                    c.id,
+                    c.current.load(Ordering::Relaxed),
+                    c.runq.lock().len(),
+                    c.idle.load(Ordering::Relaxed),
+                    c.phase.load(Ordering::Relaxed),
+                    c.switches.load(Ordering::Relaxed),
+                );
+            }
+            panic!("spinner never ran concurrently: {snap}");
+        }
+        core::hint::spin_loop();
+    }
+    SPIN_FLAG.store(true, Ordering::Release);
+    while proc::is_alive(p) {
+        core::hint::spin_loop();
+    }
+    println!("[ok] smp: two cores executed simultaneously");
+}
+
+static JOBS_DONE: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn compute_job(_arg: u64) {
+    let mut x = 0u64;
+    for i in 0..200_000u64 {
+        x = x.wrapping_add(i * i);
+        if i % 4096 == 0 {
+            proc::safepoint();
+        }
+    }
+    core::hint::black_box(x);
+    JOBS_DONE.fetch_add(1, Ordering::Release);
+}
+
+/// All jobs are spawned onto this core's queue; the other core only gets work
+/// by stealing. Every core's switch-in counter must grow.
+fn smp_stealing() {
+    let before: Vec<u64> = crate::percpu::all()
+        .iter()
+        .map(|c| c.switches.load(Ordering::Relaxed))
+        .collect();
+    JOBS_DONE.store(0, Ordering::Release);
+    for _ in 0..8 {
+        proc::spawn(compute_job, 0);
+    }
+    while JOBS_DONE.load(Ordering::Acquire) < 8 {
+        proc::yield_now();
+    }
+    for (c, b) in crate::percpu::all().iter().zip(before) {
+        assert!(
+            c.switches.load(Ordering::Relaxed) > b,
+            "cpu {} never ran a stolen process",
+            c.id
+        );
+    }
+    println!("[ok] smp: work stealing spread load across cpus");
+}
+
+extern "C" fn churn_worker(_arg: u64) {
+    proc::yield_now();
+    let _ = proc::build(|h| {
+        let l = h.list(&[Term::int(1), Term::int(2), Term::int(3)])?;
+        h.tuple(&[atoms::atom("churn"), l])
+    });
+    proc::yield_now();
+}
+
+/// 200 spawn/exit cycles across cores: exercises stack-slot recycling under
+/// TLB shootdown and cross-core reaping.
+fn smp_churn() {
+    for _ in 0..40 {
+        let pids: Vec<proc::Pid> = (0..5).map(|_| proc::spawn(churn_worker, 0)).collect();
+        for p in pids {
+            while proc::is_alive(p) {
+                proc::yield_now();
+            }
+        }
+    }
+    println!("[ok] smp: 200-process churn with TLB shootdown");
+}
+
 // ---- M3: terms and full process semantics ----
 
 /// Build a compound term, send it to ourselves (forcing a cross-heap copy),
@@ -159,8 +271,7 @@ extern "C" fn crashing_child(_arg: u64) {
 fn supervisor() {
     let down = atoms::atom("DOWN");
     for round in 1..=3 {
-        let c = proc::spawn(crashing_child, 0);
-        let r = proc::monitor(c);
+        let (c, r) = proc::spawn_monitor(crashing_child, 0);
         let msg = proc::recv();
         unsafe {
             assert_eq!(msg.tuple_arity(), 4);
@@ -186,12 +297,16 @@ extern "C" fn bad_child(_arg: u64) {
 
 /// A crashing child kills its linked parent; reason propagates.
 fn link_propagation() {
-    let a = proc::spawn(linked_parent, 0);
-    let r = proc::monitor(a);
+    let (a, r) = proc::spawn_monitor(linked_parent, 0);
+    let _ = a;
     let msg = proc::recv();
     unsafe {
         assert_eq!(msg.tuple_elem(1), Term::reference(r));
-        assert_eq!(msg.tuple_elem(3), atoms::atom("bad"), "link must propagate the reason");
+        assert_eq!(
+            msg.tuple_elem(3),
+            atoms::atom("bad"),
+            "link must propagate the reason"
+        );
     }
     println!("[ok] exit propagation over links (parent died with child's reason)");
 }
@@ -215,8 +330,7 @@ extern "C" fn heap_hog(_arg: u64) {
 }
 
 fn heap_quota() {
-    let p = proc::spawn(heap_hog, 0);
-    let r = proc::monitor(p);
+    let (_p, r) = proc::spawn_monitor(heap_hog, 0);
     let msg = proc::recv();
     unsafe {
         assert_eq!(msg.tuple_elem(1), Term::reference(r));
@@ -257,7 +371,18 @@ fn bytecode() {
 fn port_request(port: Term, op: u32, arg0: u64, arg1: u64, tag: i64) -> i64 {
     use ygg_rings::Sqe;
     let id = port.as_port().unwrap();
-    assert!(crate::ports::submit(id, Sqe { op, tag, arg0, arg1 }), "submit failed");
+    assert!(
+        crate::ports::submit(
+            id,
+            Sqe {
+                op,
+                tag,
+                arg0,
+                arg1
+            }
+        ),
+        "submit failed"
+    );
     let reply = atoms::atom("port_reply");
     let msg = proc::recv_where(
         |m| unsafe {
@@ -275,7 +400,9 @@ fn port_request(port: Term, op: u32, arg0: u64, arg1: u64, tag: i64) -> i64 {
 
 fn blk_pattern() -> Vec<u8> {
     const SEED: &[u8] = b"YGGDRASIL-BLK-PERSISTENCE-";
-    (0..512).map(|i| SEED[i % SEED.len()] ^ (i / SEED.len()) as u8).collect()
+    (0..512)
+        .map(|i| SEED[i % SEED.len()] ^ (i / SEED.len()) as u8)
+        .collect()
 }
 
 const BLK_TEST_SECTOR: u64 = 1;
@@ -285,7 +412,11 @@ fn blk_port() {
     let port = crate::ports::open(crate::ports::KIND_BLK).expect("no virtio-blk device");
     let data = blk_pattern();
     let buf = crate::ports::buf_create(data.clone());
-    assert_eq!(port_request(port, OP_WRITE, BLK_TEST_SECTOR, buf, 10), 0, "blk write failed");
+    assert_eq!(
+        port_request(port, OP_WRITE, BLK_TEST_SECTOR, buf, 10),
+        0,
+        "blk write failed"
+    );
     let r = port_request(port, OP_READ, BLK_TEST_SECTOR, 0, 11);
     assert!(r > 0, "blk read failed");
     let back = crate::ports::buf_take(r as u64).unwrap();
@@ -445,7 +576,10 @@ fn runtime_module_load() {
     assert!(r > 0);
     let first = crate::ports::buf_take(r as u64).unwrap();
     let len = u32::from_le_bytes(first[0..4].try_into().unwrap()) as usize;
-    assert!(len > 0 && len < 1024 * 1024, "implausible module length {len}");
+    assert!(
+        len > 0 && len < 1024 * 1024,
+        "implausible module length {len}"
+    );
     let mut bytes = first[4..].to_vec();
     let mut sector = MODULE_SECTOR + 1;
     while bytes.len() < len {
@@ -480,7 +614,12 @@ fn hot_code_loading() {
     let ask = || -> (Term, i64) {
         proc::send(server, Term::pid(me));
         let msg = proc::recv_timeout(10_000).expect("counter did not reply");
-        unsafe { (msg.tuple_elem(0), msg.tuple_elem(1).as_int().expect("non-int count")) }
+        unsafe {
+            (
+                msg.tuple_elem(0),
+                msg.tuple_elem(1).as_int().expect("non-int count"),
+            )
+        }
     };
     let (count, count2) = (atoms::atom("count"), atoms::atom("count2"));
 
@@ -513,7 +652,10 @@ fn hot_code_loading() {
     let killed = crate::modload::purge("counter");
     assert!(killed >= 1, "purge found no holdouts");
     assert!(!proc::is_alive(holdout), "holdout survived purge");
-    assert!(proc::is_alive(server), "purge must spare migrated processes");
+    assert!(
+        proc::is_alive(server),
+        "purge must spare migrated processes"
+    );
     proc::kill(server, "test finished");
     println!("[ok] hot upgrade v1->v2: state retained, new format, purge killed the holdout");
 }
@@ -545,6 +687,221 @@ fn differential_engines() {
     println!("[ok] differential: interpreter and Cranelift JIT agree on mathmod");
 }
 
+// ---- M10: the Lux TCP/IP stack, compiled by Lux to Yggdrasil bytecode ----
+
+/// Engine tier for the Lux modules (toggle for differential debugging).
+const LUX_USE_JIT: bool = true;
+
+/// Parse the luxpack (all content-addressed modules of examples/tcp_ip.lux),
+/// load each one, then run the stack's own deterministic protocol suite —
+/// checksum vectors, corruption rejection, a full handshake with data
+/// transfer, and an orderly close — as a Yggdrasil process. `main/0` returns
+/// the atom `true` iff every protocol scenario passed.
+fn lux_tcp_stack() {
+    let me = proc::current();
+    // 16 MiB heap: packet codecs churn lists/binaries and there is no GC yet.
+    proc::spawn_with_heap(lux_tcp_runner, Term::pid(me).0, 4096);
+    let msg = proc::recv_timeout(120_000).expect("lux tcp stack never reported");
+    assert_eq!(msg, atoms::atom("lux_tcp_ok"), "lux tcp/ip self-test failed");
+    println!("[ok] lux tcp/ip stack: full protocol suite passed on yggdrasil");
+}
+
+extern "C" fn lux_tcp_runner(parent_raw: u64) {
+    let parent = Term(parent_raw).as_pid().unwrap();
+    let pack = crate::modload::boot_module_bytes("tcp_ip.luxpack").expect("no luxpack");
+    let entry = load_luxpack(pack).expect("bad luxpack");
+
+    let module = crate::modload::current(&entry).expect("entry module missing");
+    let fn_idx = module.module.function_named("apply").expect("no apply/0");
+    let result = crate::modload::invoke(&module, fn_idx, &[]).expect("lux main trapped");
+    assert_eq!(result, atoms::atom("true"), "lux tcp_ip:main() returned false");
+    proc::send(parent, atoms::atom("lux_tcp_ok"));
+}
+
+/// Lux source_name -> content-addressed module hash, from the luxpack.
+static LUX_ALIASES: spin::Mutex<BTreeMap<alloc::string::String, alloc::string::String>> =
+    spin::Mutex::new(BTreeMap::new());
+
+/// Resolve a Lux function's module by source name and invoke its `apply`.
+fn lux_call(name: &str, args: &[Term]) -> Term {
+    let hash = LUX_ALIASES.lock().get(name).cloned().unwrap_or_else(|| panic!("no lux fn {name}"));
+    let module = crate::modload::current(&hash).expect("lux module missing");
+    let fn_idx = module.module.function_named("apply").expect("no apply");
+    crate::modload::invoke(&module, fn_idx, args)
+        .unwrap_or_else(|t| panic!("lux {name} trapped: {t:?}"))
+}
+
+/// `LUXPK1\n [u32 entry_len][entry][u32 count] count*([u32 nlen][name][u32 dlen][data])`
+/// then `[u32 alias_count] count*([u32 len][source_name][u32 len][hash])`.
+fn load_luxpack(bytes: &[u8]) -> Option<alloc::string::String> {
+    let mut at = 0usize;
+    let take = |at: &mut usize, n: usize| -> Option<&[u8]> {
+        let s = bytes.get(*at..*at + n)?;
+        *at += n;
+        Some(s)
+    };
+    let u32at = |at: &mut usize| -> Option<usize> {
+        Some(u32::from_le_bytes(take(at, 4)?.try_into().ok()?) as usize)
+    };
+    let strat = |at: &mut usize| -> Option<alloc::string::String> {
+        let n = u32at(at)?;
+        core::str::from_utf8(take(at, n)?).ok().map(alloc::string::String::from)
+    };
+    if take(&mut at, 7)? != b"LUXPK1\n" {
+        return None;
+    }
+    let entry = strat(&mut at)?;
+    let count = u32at(&mut at)?;
+    for _ in 0..count {
+        let name = strat(&mut at)?;
+        let dlen = u32at(&mut at)?;
+        let data = take(&mut at, dlen)?;
+        crate::modload::load_with_engine(&name, data, LUX_USE_JIT).ok()?;
+    }
+    let alias_count = u32at(&mut at)?;
+    let mut aliases = LUX_ALIASES.lock();
+    for _ in 0..alias_count {
+        let name = strat(&mut at)?;
+        let hash = strat(&mut at)?;
+        aliases.insert(name, hash);
+    }
+    Some(entry)
+}
+
+// ---- M10 phase B: the Lux stack serving a real host TCP connection ----
+
+/// The harness forwards host 127.0.0.1:17799 to guest 10.0.2.15:7 (slirp).
+/// A native adapter owns the NIC: it answers ARP, unwraps IPv4/TCP packets
+/// into the Lux stack's pure `input`, and transmits whatever the stack emits.
+/// Data delivered by the stack is echoed back through `tcp_send`. The TCP
+/// protocol work — handshake, ACKs, teardown — is all Lux bytecode.
+fn lux_tcp_echo_live() {
+    let me = proc::current();
+    let adapter = proc::spawn_with_heap(tcp_echo_adapter, Term::pid(me).0, 4096);
+    let msg = proc::recv_timeout(60_000).expect("live tcp echo never completed");
+    assert_eq!(msg, atoms::atom("tcp_echo_served"));
+    println!("[ok] lux tcp stack served a real host connection (SYN->echo)");
+    proc::kill(adapter, "test finished");
+}
+
+const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+const GUEST_TCP_PORT: u16 = 7;
+
+extern "C" fn tcp_echo_adapter(parent_raw: u64) {
+    let parent = Term(parent_raw).as_pid().unwrap();
+    let port = crate::ports::open(crate::ports::KIND_NET).expect("no virtio-net");
+    let mac = crate::virtio::net_mac();
+
+    // conn = tcp_ip:listening(#{a..d}, 7, InitialSeq)
+    let ip_term = proc::build(|h| {
+        let mut pairs = [
+            (atoms::atom("a"), Term::int(GUEST_IP[0] as i64)),
+            (atoms::atom("b"), Term::int(GUEST_IP[1] as i64)),
+            (atoms::atom("c"), Term::int(GUEST_IP[2] as i64)),
+            (atoms::atom("d"), Term::int(GUEST_IP[3] as i64)),
+        ];
+        h.map_from_pairs(&mut pairs).map_err(|_| ygg_term::HeapFull)
+    });
+    let mut conn = lux_call(
+        "listening",
+        &[ip_term, Term::int(GUEST_TCP_PORT as i64), Term::int(12345)],
+    );
+    println!("[tcp] listening on {}.{}.{}.{}:{}", GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3], GUEST_TCP_PORT);
+
+    let mut served = false;
+    loop {
+        let frame = net_rx(port);
+        // ARP request for our IP?
+        if frame.len() >= 42 && frame[12..14] == [0x08, 0x06] && frame[20..22] == [0, 1] {
+            if frame[38..42] == GUEST_IP {
+                let mut reply = Vec::with_capacity(42);
+                reply.extend_from_slice(&frame[6..12]); // dst = requester
+                reply.extend_from_slice(&mac);
+                reply.extend_from_slice(&[0x08, 0x06, 0, 1, 8, 0, 6, 4, 0, 2]);
+                reply.extend_from_slice(&mac);
+                reply.extend_from_slice(&GUEST_IP);
+                reply.extend_from_slice(&frame[22..28]); // requester mac
+                reply.extend_from_slice(&frame[28..32]); // requester ip
+                reply.resize(60, 0);
+                net_tx(port, reply);
+            }
+            continue;
+        }
+        // IPv4/TCP to us?
+        if frame.len() >= 34 && frame[12..14] == [0x08, 0x00] && frame[23] == 6 {
+            let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+            let ip_len = u16::from_be_bytes([frame[16], frame[17]]) as usize;
+            if frame.len() < 14 + ip_len {
+                continue;
+            }
+            let packet = &frame[14..14 + ip_len];
+            let pkt_term = proc::build(|h| h.binary(packet));
+            let step = lux_call("input", &[conn, pkt_term]);
+            conn = step_field(step, "connection");
+            let event = step_field(step, "event").as_int().unwrap_or(0);
+            tx_outbound(port, mac, peer_mac, step_field(step, "outbound"));
+            if event == 2 {
+                // Data delivered: echo it back through the stack.
+                let delivered = step_field(step, "delivered");
+                let step2 = lux_call("tcp_send", &[conn, delivered]);
+                conn = step_field(step2, "connection");
+                tx_outbound(port, mac, peer_mac, step_field(step2, "outbound"));
+                if !served {
+                    served = true;
+                    proc::send(parent, atoms::atom("tcp_echo_served"));
+                }
+            }
+            if event == 3 {
+                // Peer closed: close our side too and keep ACKing the rest.
+                let step3 = lux_call("close", &[conn]);
+                conn = step_field(step3, "connection");
+                tx_outbound(port, mac, peer_mac, step_field(step3, "outbound"));
+            }
+        }
+    }
+}
+
+fn step_field(step: Term, name: &str) -> Term {
+    unsafe {
+        assert!(step.is_boxed() && step.kind() == ygg_term::Kind::Map, "TcpStep is not a map");
+        step.map_get(atoms::atom(name)).unwrap_or_else(|| panic!("TcpStep missing {name}"))
+    }
+}
+
+/// Blocking frame receive through the port rings.
+fn net_rx(port: Term) -> Vec<u8> {
+    use crate::ports::OP_READ;
+    let r = port_request(port, OP_READ, 0, 0, 40);
+    assert!(r > 0, "net rx failed");
+    crate::ports::buf_take(r as u64).unwrap()
+}
+
+fn net_tx(port: Term, frame: Vec<u8>) {
+    use crate::ports::OP_WRITE;
+    let buf = crate::ports::buf_create(frame);
+    assert_eq!(port_request(port, OP_WRITE, 0, buf, 41), 0, "net tx failed");
+}
+
+/// Wrap a stack-emitted IPv4 packet (binary term) in ethernet and transmit.
+fn tx_outbound(port: Term, src_mac: [u8; 6], dst_mac: [u8; 6], outbound: Term) {
+    let payload = unsafe {
+        assert!(outbound.is_boxed() && outbound.kind() == ygg_term::Kind::Binary);
+        outbound.bin_bytes()
+    };
+    if payload.is_empty() {
+        return;
+    }
+    let mut frame = Vec::with_capacity(14 + payload.len());
+    frame.extend_from_slice(&dst_mac);
+    frame.extend_from_slice(&src_mac);
+    frame.extend_from_slice(&[0x08, 0x00]);
+    frame.extend_from_slice(payload);
+    if frame.len() < 60 {
+        frame.resize(60, 0);
+    }
+    net_tx(port, frame);
+}
+
 /// Spawn the bytecode echo server: it opens the serial port, prints a ready
 /// marker (which cues the host harness to type "PING\n"), echoes every byte
 /// through the SQ/CQ rings, and reports back after the newline.
@@ -566,7 +923,11 @@ fn selective_receive() {
     proc::send(me, Term::int(2));
     let picked = proc::recv_where(|m| m == atoms::atom("wanted"), None).unwrap();
     assert_eq!(picked, atoms::atom("wanted"));
-    assert_eq!(proc::recv().as_int(), Some(1), "skipped messages must stay in order");
+    assert_eq!(
+        proc::recv().as_int(),
+        Some(1),
+        "skipped messages must stay in order"
+    );
     assert_eq!(proc::recv().as_int(), Some(2));
     println!("[ok] selective receive picked the matching message first");
 }
@@ -639,7 +1000,10 @@ fn acpi() {
     let p = crate::acpi_tables::platform();
     assert!(p.lapic_phys != 0, "no LAPIC address");
     assert!(!p.ioapics.is_empty(), "no IOAPIC");
-    assert!(!p.ecam.is_empty(), "no ECAM (MCFG) — q35 should have MMCONFIG");
+    assert!(
+        !p.ecam.is_empty(),
+        "no ECAM (MCFG) — q35 should have MMCONFIG"
+    );
     println!(
         "[ok] acpi: lapic={:#x} ioapic0={:#x} ecam0={:#x}",
         p.lapic_phys, p.ioapics[0].phys_addr, p.ecam[0].base

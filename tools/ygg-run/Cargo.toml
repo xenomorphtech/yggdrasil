@@ -1,0 +1,12 @@
+[package]
+name = "ygg-run"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+libc = "0.2.189"
+ygg-bytecode = { path = "../../crates/ygg-bytecode" }
+ygg-interp = { path = "../../crates/ygg-interp" }
+ygg-jit = { version = "0.1.0", path = "../../crates/ygg-jit" }
+ygg-term = { path = "../../crates/ygg-term" }

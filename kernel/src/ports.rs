@@ -74,7 +74,9 @@ pub fn open(kind: u8) -> Option<Term> {
 /// Push an SQE and run the driver's submit path.
 pub fn submit(port_id: u64, sqe: Sqe) -> bool {
     let mut ports = PORTS.lock();
-    let Some(p) = ports.get_mut(&port_id) else { return false };
+    let Some(p) = ports.get_mut(&port_id) else {
+        return false;
+    };
     if p.sq.push(sqe).is_err() {
         return false;
     }
@@ -96,7 +98,10 @@ fn serial_drain_sq(p: &mut Port) {
             OP_WRITE => {
                 crate::serial::raw_write_byte(sqe.arg0 as u8);
                 if sqe.tag != SKIP_CQE {
-                    let _ = p.cq.push(Cqe { tag: sqe.tag, result: 0 });
+                    let _ = p.cq.push(Cqe {
+                        tag: sqe.tag,
+                        result: 0,
+                    });
                 }
             }
             OP_READ => {
@@ -105,7 +110,10 @@ fn serial_drain_sq(p: &mut Port) {
             }
             _ => {
                 if sqe.tag != SKIP_CQE {
-                    let _ = p.cq.push(Cqe { tag: sqe.tag, result: -1 });
+                    let _ = p.cq.push(Cqe {
+                        tag: sqe.tag,
+                        result: -1,
+                    });
                 }
             }
         }
@@ -131,7 +139,10 @@ fn blk_drain_sq(p: &mut Port) {
             _ => -1,
         };
         if sqe.tag != SKIP_CQE {
-            let _ = p.cq.push(Cqe { tag: sqe.tag, result });
+            let _ = p.cq.push(Cqe {
+                tag: sqe.tag,
+                result,
+            });
         }
     }
 }
@@ -149,7 +160,10 @@ fn net_drain_sq(p: &mut Port) {
                     None => -1,
                 };
                 if sqe.tag != SKIP_CQE {
-                    let _ = p.cq.push(Cqe { tag: sqe.tag, result });
+                    let _ = p.cq.push(Cqe {
+                        tag: sqe.tag,
+                        result,
+                    });
                 }
             }
             OP_READ => {
@@ -157,7 +171,10 @@ fn net_drain_sq(p: &mut Port) {
             }
             _ => {
                 if sqe.tag != SKIP_CQE {
-                    let _ = p.cq.push(Cqe { tag: sqe.tag, result: -1 });
+                    let _ = p.cq.push(Cqe {
+                        tag: sqe.tag,
+                        result: -1,
+                    });
                 }
             }
         }
@@ -204,18 +221,24 @@ pub fn pump() {
                     while !SERIAL_RX.is_empty() && !p.pending_reads.is_empty() {
                         let sqe = p.pending_reads.pop().unwrap();
                         let b = SERIAL_RX.pop().unwrap();
-                        let _ = p.cq.push(Cqe { tag: sqe.tag, result: b as i64 });
+                        let _ = p.cq.push(Cqe {
+                            tag: sqe.tag,
+                            result: b as i64,
+                        });
                     }
                 }
                 KIND_NET => {
                     // Polled rx for now (INTx/MSI-X later): at most one frame
                     // per parked read per pump pass.
                     while !p.pending_reads.is_empty() {
-                        let Some(frame) = crate::virtio::net_try_recv() else { break };
+                        let Some(frame) = crate::virtio::net_try_recv() else {
+                            break;
+                        };
                         let sqe = p.pending_reads.pop().unwrap();
-                        let _ = p
-                            .cq
-                            .push(Cqe { tag: sqe.tag, result: buf_create(frame) as i64 });
+                        let _ = p.cq.push(Cqe {
+                            tag: sqe.tag,
+                            result: buf_create(frame) as i64,
+                        });
                     }
                 }
                 _ => {}

@@ -36,7 +36,9 @@ pub fn phys_to_virt(phys: u64) -> *mut u8 {
 pub fn virt_to_phys(virt: u64) -> u64 {
     const IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
     if virt >= IMAGE_BASE {
-        let a = crate::boot::EXECUTABLE_ADDRESS.response().expect("no executable address");
+        let a = crate::boot::EXECUTABLE_ADDRESS
+            .response()
+            .expect("no executable address");
         a.physical_base + (virt - a.virtual_base)
     } else if crate::vmm::in_stack_zone(virt) {
         // Process stacks: walk the page tables (frames per stack are
@@ -67,9 +69,8 @@ pub fn init() {
         .iter()
         .find(|e| e.type_ == MEMMAP_USABLE && e.length >= storage_bytes)
         .expect("no region can host the frame bitmap");
-    let storage: &'static mut [u64] = unsafe {
-        core::slice::from_raw_parts_mut(phys_to_virt(host.base).cast::<u64>(), words)
-    };
+    let storage: &'static mut [u64] =
+        unsafe { core::slice::from_raw_parts_mut(phys_to_virt(host.base).cast::<u64>(), words) };
 
     let mut bitmap = FrameBitmap::new(0, nframes, storage);
     for e in entries.iter().filter(|e| e.type_ == MEMMAP_USABLE) {
@@ -102,7 +103,10 @@ pub fn alloc_contig(n: usize, align_frames: usize) -> Option<u64> {
 }
 
 pub fn free_frames(addr: u64, n: usize) {
-    PMM.lock().as_mut().expect("pmm uninitialized").free_frames(addr, n);
+    PMM.lock()
+        .as_mut()
+        .expect("pmm uninitialized")
+        .free_frames(addr, n);
 }
 
 pub fn free_frame_count() -> usize {

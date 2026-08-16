@@ -95,7 +95,12 @@ pub fn init() {
         }
     }
 
-    let p = Platform { lapic_phys, ioapics, isa_overrides, ecam };
+    let p = Platform {
+        lapic_phys,
+        ioapics,
+        isa_overrides,
+        ecam,
+    };
     log::info!(
         "acpi: lapic={:#x}, {} ioapic(s), {} isa override(s), {} ecam region(s)",
         p.lapic_phys,

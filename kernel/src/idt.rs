@@ -23,11 +23,13 @@ static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
     idt.overflow.set_handler_fn(overflow);
     idt.bound_range_exceeded.set_handler_fn(bound_range);
     idt.invalid_opcode.set_handler_fn(invalid_opcode);
-    idt.device_not_available.set_handler_fn(device_not_available);
+    idt.device_not_available
+        .set_handler_fn(device_not_available);
     idt.invalid_tss.set_handler_fn(invalid_tss);
     idt.segment_not_present.set_handler_fn(segment_not_present);
     idt.stack_segment_fault.set_handler_fn(stack_segment_fault);
-    idt.general_protection_fault.set_handler_fn(general_protection);
+    idt.general_protection_fault
+        .set_handler_fn(general_protection);
     idt.x87_floating_point.set_handler_fn(x87_fp);
     idt.alignment_check.set_handler_fn(alignment_check);
     idt.simd_floating_point.set_handler_fn(simd_fp);
@@ -46,6 +48,9 @@ static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
             .set_stack_index(gdt::PAGE_FAULT_IST);
     }
     idt[crate::irq::TIMER_VECTOR].set_handler_fn(crate::irq::timer_interrupt);
+    idt[crate::irq::WAKE_VECTOR].set_handler_fn(crate::irq::wake_interrupt);
+    idt[crate::irq::TLB_FLUSH_VECTOR].set_handler_fn(crate::irq::tlb_flush_interrupt);
+    idt[crate::irq::HALT_VECTOR].set_handler_fn(crate::irq::halt_interrupt);
     idt[crate::irq::SERIAL_VECTOR].set_handler_fn(crate::irq::serial_interrupt);
     idt[crate::irq::SPURIOUS_VECTOR].set_handler_fn(crate::irq::spurious_interrupt);
     idt
@@ -54,6 +59,11 @@ static IDT: LazyLock<InterruptDescriptorTable> = LazyLock::new(|| {
 pub fn init() {
     IDT.load();
     remap_and_mask_pics();
+}
+
+/// Load the shared IDT on an AP (the PICs were already remapped by the BSP).
+pub fn load_ap() {
+    IDT.load();
 }
 
 /// Remap the legacy PICs away from the exception vectors, then mask everything.
@@ -80,7 +90,10 @@ fn remap_and_mask_pics() {
 macro_rules! fatal_handler {
     ($name:ident, $label:expr) => {
         extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
-            panic!("EXCEPTION: {} at {:?}\n{:#?}", $label, frame.instruction_pointer, frame);
+            panic!(
+                "EXCEPTION: {} at {:?}\n{:#?}",
+                $label, frame.instruction_pointer, frame
+            );
         }
     };
     ($name:ident, $label:expr, err) => {
@@ -101,9 +114,21 @@ fatal_handler!(bound_range, "bound range exceeded (#BR, vector 5)");
 fatal_handler!(invalid_opcode, "invalid opcode (#UD, vector 6)");
 fatal_handler!(device_not_available, "device not available (#NM, vector 7)");
 fatal_handler!(invalid_tss, "invalid TSS (#TS, vector 10)", err);
-fatal_handler!(segment_not_present, "segment not present (#NP, vector 11)", err);
-fatal_handler!(stack_segment_fault, "stack segment fault (#SS, vector 12)", err);
-fatal_handler!(general_protection, "general protection fault (#GP, vector 13)", err);
+fatal_handler!(
+    segment_not_present,
+    "segment not present (#NP, vector 11)",
+    err
+);
+fatal_handler!(
+    stack_segment_fault,
+    "stack segment fault (#SS, vector 12)",
+    err
+);
+fatal_handler!(
+    general_protection,
+    "general protection fault (#GP, vector 13)",
+    err
+);
 fatal_handler!(x87_fp, "x87 floating point (#MF, vector 16)");
 fatal_handler!(alignment_check, "alignment check (#AC, vector 17)", err);
 fatal_handler!(simd_fp, "SIMD floating point (#XM, vector 19)");

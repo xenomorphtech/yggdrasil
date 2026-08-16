@@ -63,13 +63,18 @@ extern "C" fn do_compile(p: u64) -> u64 {
 
 /// Compile and publish a verified module. Returns None (and logs) on any
 /// failure — the caller falls back to the interpreter.
-pub fn compile_and_publish(
-    module: &ygg_bytecode::Module,
-    atom_map: &[u32],
-) -> Option<JitModule> {
+pub fn compile_and_publish(module: &ygg_bytecode::Module, atom_map: &[u32]) -> Option<JitModule> {
     let _guard = COMPILE_LOCK.lock();
-    let mut req = CompileReq { module, atom_map, out: None };
-    let top = unsafe { (&raw const COMPILE_STACK).cast::<u8>().add(COMPILE_STACK_SIZE) } as u64;
+    let mut req = CompileReq {
+        module,
+        atom_map,
+        out: None,
+    };
+    let top = unsafe {
+        (&raw const COMPILE_STACK)
+            .cast::<u8>()
+            .add(COMPILE_STACK_SIZE)
+    } as u64;
     unsafe { on_stack(&raw mut req as u64, do_compile, top) };
     let fns = match req.out.expect("compile never ran") {
         Ok(f) => f,
@@ -132,7 +137,10 @@ fn publish(fns: &[CompiledFn]) -> JitModule {
         total,
         base_exec
     );
-    JitModule { fn_addrs, span: (span, pages) }
+    JitModule {
+        fn_addrs,
+        span: (span, pages),
+    }
 }
 
 fn helper_table() -> [u64; HELPER_COUNT] {
@@ -154,6 +162,19 @@ fn helper_table() -> [u64; HELPER_COUNT] {
     t[Helper::CallExt as usize] = rt_call_ext as usize as u64;
     t[Helper::ExitAtom as usize] = rt_exit_atom as usize as u64;
     t[Helper::TrapBadarg as usize] = rt_trap_badarg as usize as u64;
+    t[Helper::BinConst as usize] = rt_bin_const as usize as u64;
+    t[Helper::BinFromList as usize] = rt_bin_from_list as usize as u64;
+    t[Helper::BinToList as usize] = rt_bin_to_list as usize as u64;
+    t[Helper::BinSize as usize] = rt_bin_size as usize as u64;
+    t[Helper::BufToBin as usize] = rt_buf_to_bin as usize as u64;
+    t[Helper::BinToBuf as usize] = rt_bin_to_buf as usize as u64;
+    t[Helper::MapNew as usize] = rt_map_new as usize as u64;
+    t[Helper::MapGet as usize] = rt_map_get as usize as u64;
+    t[Helper::MapPut as usize] = rt_map_put as usize as u64;
+    t[Helper::IsBinary as usize] = rt_is_binary as usize as u64;
+    t[Helper::BinCat as usize] = rt_bin_cat as usize as u64;
+    t[Helper::ListCat as usize] = rt_list_cat as usize as u64;
+    t[Helper::BinPart as usize] = rt_bin_part as usize as u64;
     t
 }
 
@@ -191,7 +212,9 @@ extern "C" fn rt_spawn(fn_idx: u64, arg: u64) -> u64 {
     if arg.is_boxed() {
         badarg();
     }
-    let Some(m) = modload::current_process_module() else { badarg() };
+    let Some(m) = modload::current_process_module() else {
+        badarg()
+    };
     if m.module.functions.get(fn_idx as usize).is_none() {
         badarg();
     }
@@ -239,14 +262,22 @@ extern "C" fn rt_cons(h: u64, t: u64) -> u64 {
 extern "C" fn rt_head(t: u64) -> u64 {
     let t = Term(t);
     unsafe {
-        if t.is_boxed() && t.kind() == ygg_term::Kind::Cons { t.head().0 } else { badarg() }
+        if t.is_boxed() && t.kind() == ygg_term::Kind::Cons {
+            t.head().0
+        } else {
+            badarg()
+        }
     }
 }
 
 extern "C" fn rt_tail(t: u64) -> u64 {
     let t = Term(t);
     unsafe {
-        if t.is_boxed() && t.kind() == ygg_term::Kind::Cons { t.tail().0 } else { badarg() }
+        if t.is_boxed() && t.kind() == ygg_term::Kind::Cons {
+            t.tail().0
+        } else {
+            badarg()
+        }
     }
 }
 
@@ -258,17 +289,30 @@ extern "C" fn rt_port_open(kind: u64) -> u64 {
 }
 
 extern "C" fn rt_port_submit(port: u64, op: u64, arg0: u64, tag: u64) -> u64 {
-    let (Some(id), Some(a0), Some(tg)) =
-        (Term(port).as_port(), Term(arg0).as_int(), Term(tag).as_int())
-    else {
+    let (Some(id), Some(a0), Some(tg)) = (
+        Term(port).as_port(),
+        Term(arg0).as_int(),
+        Term(tag).as_int(),
+    ) else {
         badarg()
     };
-    let sqe = ygg_rings::Sqe { op: op as u32, tag: tg, arg0: a0 as u64, arg1: 0 };
-    if crate::ports::submit(id, sqe) { 0 } else { badarg() }
+    let sqe = ygg_rings::Sqe {
+        op: op as u32,
+        tag: tg,
+        arg0: a0 as u64,
+        arg1: 0,
+    };
+    if crate::ports::submit(id, sqe) {
+        0
+    } else {
+        badarg()
+    }
 }
 
 extern "C" fn rt_call_ext(matom: u64, fatom: u64, ptr: *const Term, n: u64) -> u64 {
-    let (Some(ma), Some(fa)) = (Term(matom).as_atom(), Term(fatom).as_atom()) else { badarg() };
+    let (Some(ma), Some(fa)) = (Term(matom).as_atom(), Term(fatom).as_atom()) else {
+        badarg()
+    };
     let args = unsafe { core::slice::from_raw_parts(ptr, n as usize) };
     let caller: Option<Arc<LoadedModule>> = modload::current_process_module();
     match modload::call_ext_dynamic(ma, fa, args) {
@@ -291,4 +335,190 @@ extern "C" fn rt_exit_atom(a: u64) -> u64 {
 
 extern "C" fn rt_trap_badarg() -> u64 {
     badarg()
+}
+
+/// `ptr` points into the running module's bytecode (kept alive by the same
+/// Arc that owns this generated code).
+extern "C" fn rt_bin_const(ptr: *const u8, len: u64) -> u64 {
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len as usize) };
+    match proc::with_heap(|h| h.binary(bytes)) {
+        Ok(t) => t.0,
+        Err(HeapFull) => quota(),
+    }
+}
+
+extern "C" fn rt_bin_from_list(list: u64) -> u64 {
+    let mut cur = Term(list);
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    unsafe {
+        while cur.is_boxed() && cur.kind() == ygg_term::Kind::Cons {
+            let Some(v) = cur.head().as_int() else { badarg() };
+            if !(0..=255).contains(&v) {
+                badarg();
+            }
+            bytes.push(v as u8);
+            cur = cur.tail();
+        }
+    }
+    if !cur.is_nil() {
+        badarg();
+    }
+    match proc::with_heap(|h| h.binary(&bytes)) {
+        Ok(t) => t.0,
+        Err(HeapFull) => quota(),
+    }
+}
+
+extern "C" fn rt_bin_to_list(bin: u64) -> u64 {
+    let t = Term(bin);
+    let elems: alloc::vec::Vec<Term> = unsafe {
+        if !t.is_boxed() || t.kind() != ygg_term::Kind::Binary {
+            badarg();
+        }
+        t.bin_bytes().iter().map(|&b| Term::int(b as i64)).collect()
+    };
+    match proc::with_heap(|h| h.list(&elems)) {
+        Ok(l) => l.0,
+        Err(HeapFull) => quota(),
+    }
+}
+
+extern "C" fn rt_bin_size(bin: u64) -> u64 {
+    let t = Term(bin);
+    unsafe {
+        if !t.is_boxed() || t.kind() != ygg_term::Kind::Binary {
+            badarg();
+        }
+        Term::int(t.bin_bytes().len() as i64).0
+    }
+}
+
+extern "C" fn rt_buf_to_bin(id: u64) -> u64 {
+    let Some(id) = Term(id).as_int() else { badarg() };
+    let Some(data) = crate::ports::buf_take(id as u64) else { badarg() };
+    match proc::with_heap(|h| h.binary(&data)) {
+        Ok(t) => t.0,
+        Err(HeapFull) => quota(),
+    }
+}
+
+extern "C" fn rt_bin_to_buf(bin: u64) -> u64 {
+    let t = Term(bin);
+    let data = unsafe {
+        if !t.is_boxed() || t.kind() != ygg_term::Kind::Binary {
+            badarg();
+        }
+        t.bin_bytes().to_vec()
+    };
+    Term::int(crate::ports::buf_create(data) as i64).0
+}
+
+fn map_or_die(r: Result<Term, ygg_term::MapError>) -> u64 {
+    match r {
+        Ok(t) => t.0,
+        Err(ygg_term::MapError::Heap(_)) => quota(),
+        Err(ygg_term::MapError::NonImmediateKey) => badarg(),
+    }
+}
+
+extern "C" fn rt_map_new(ptr: *const Term, n_pairs: u64) -> u64 {
+    let flat = unsafe { core::slice::from_raw_parts(ptr, 2 * n_pairs as usize) };
+    let mut pairs: alloc::vec::Vec<(Term, Term)> =
+        flat.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+    map_or_die(proc::with_heap(|h| h.map_from_pairs(&mut pairs)))
+}
+
+extern "C" fn rt_map_get(map: u64, key: u64) -> u64 {
+    let m = Term(map);
+    unsafe {
+        if !m.is_boxed() || m.kind() != ygg_term::Kind::Map {
+            badarg();
+        }
+        match m.map_get(Term(key)) {
+            Some(v) => v.0,
+            None => badarg(),
+        }
+    }
+}
+
+extern "C" fn rt_map_put(map: u64, key: u64, val: u64) -> u64 {
+    let m = Term(map);
+    unsafe {
+        if !m.is_boxed() || m.kind() != ygg_term::Kind::Map {
+            badarg();
+        }
+        map_or_die(proc::with_heap(|h| h.map_put(m, Term(key), Term(val))))
+    }
+}
+
+extern "C" fn rt_is_binary(t: u64) -> u64 {
+    let t = Term(t);
+    unsafe { (t.is_boxed() && t.kind() == ygg_term::Kind::Binary) as u64 }
+}
+
+extern "C" fn rt_bin_cat(a: u64, b: u64) -> u64 {
+    let (a, b) = (Term(a), Term(b));
+    let joined: alloc::vec::Vec<u8> = unsafe {
+        if !a.is_boxed()
+            || a.kind() != ygg_term::Kind::Binary
+            || !b.is_boxed()
+            || b.kind() != ygg_term::Kind::Binary
+        {
+            badarg();
+        }
+        let mut v = a.bin_bytes().to_vec();
+        v.extend_from_slice(b.bin_bytes());
+        v
+    };
+    match proc::with_heap(|h| h.binary(&joined)) {
+        Ok(t) => t.0,
+        Err(HeapFull) => quota(),
+    }
+}
+
+extern "C" fn rt_list_cat(a: u64, b: u64) -> u64 {
+    let mut elems: alloc::vec::Vec<Term> = alloc::vec::Vec::new();
+    let mut cur = Term(a);
+    unsafe {
+        while cur.is_boxed() && cur.kind() == ygg_term::Kind::Cons {
+            elems.push(cur.head());
+            cur = cur.tail();
+        }
+    }
+    if !cur.is_nil() {
+        badarg();
+    }
+    let out = proc::with_heap(|h| {
+        let mut out = Term(b);
+        for e in elems.into_iter().rev() {
+            out = h.cons(e, out)?;
+        }
+        Ok::<Term, ygg_term::HeapFull>(out)
+    });
+    match out {
+        Ok(t) => t.0,
+        Err(HeapFull) => quota(),
+    }
+}
+
+extern "C" fn rt_bin_part(bin: u64, off: u64, len: u64) -> u64 {
+    let b = Term(bin);
+    let (Some(off), Some(len)) = (Term(off).as_int(), Term(len).as_int()) else {
+        badarg()
+    };
+    let part: alloc::vec::Vec<u8> = unsafe {
+        if !b.is_boxed() || b.kind() != ygg_term::Kind::Binary || off < 0 || len < 0 {
+            badarg();
+        }
+        let bytes = b.bin_bytes();
+        let (off, len) = (off as usize, len as usize);
+        if off + len > bytes.len() {
+            badarg();
+        }
+        bytes[off..off + len].to_vec()
+    };
+    match proc::with_heap(|h| h.binary(&part)) {
+        Ok(t) => t.0,
+        Err(HeapFull) => quota(),
+    }
 }

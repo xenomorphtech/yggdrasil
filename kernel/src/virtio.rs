@@ -72,15 +72,15 @@ pub fn init() {
         root.set_command(df, Command::MEMORY_SPACE | Command::BUS_MASTER);
         match ty {
             DeviceType::Block => {
-                let t = PciTransport::new::<KernelHal, _>(&mut root, df)
-                    .expect("virtio-blk transport");
+                let t =
+                    PciTransport::new::<KernelHal, _>(&mut root, df).expect("virtio-blk transport");
                 let blk = VirtIOBlk::new(t).expect("virtio-blk init");
                 log::info!("virtio: blk at {df}, {} sectors", blk.capacity());
                 *BLK.lock() = Some(blk);
             }
             DeviceType::Network => {
-                let t = PciTransport::new::<KernelHal, _>(&mut root, df)
-                    .expect("virtio-net transport");
+                let t =
+                    PciTransport::new::<KernelHal, _>(&mut root, df).expect("virtio-net transport");
                 let net = VirtIONet::new(t, NET_BUF_LEN).expect("virtio-net init");
                 log::info!("virtio: net at {df}, mac {:02x?}", net.mac_address());
                 *NET.lock() = Some(net);
@@ -102,19 +102,24 @@ pub fn blk_read(sector: u64) -> Result<alloc::vec::Vec<u8>, ()> {
     let mut guard = BLK.lock();
     let blk = guard.as_mut().ok_or(())?;
     let mut buf = alloc::vec![0u8; SECTOR_SIZE];
-    blk.read_blocks(sector as usize, &mut buf).map_err(|e| log::warn!("blk read: {e:?}"))?;
+    blk.read_blocks(sector as usize, &mut buf)
+        .map_err(|e| log::warn!("blk read: {e:?}"))?;
     Ok(buf)
 }
 
 pub fn blk_write(sector: u64, data: &[u8]) -> Result<(), ()> {
     let mut guard = BLK.lock();
     let blk = guard.as_mut().ok_or(())?;
-    blk.write_blocks(sector as usize, data).map_err(|e| log::warn!("blk write: {e:?}"))?;
+    blk.write_blocks(sector as usize, data)
+        .map_err(|e| log::warn!("blk write: {e:?}"))?;
     blk.flush().map_err(|e| log::warn!("blk flush: {e:?}"))
 }
 
 pub fn net_mac() -> [u8; 6] {
-    NET.lock().as_ref().map(|n| n.mac_address()).unwrap_or_default()
+    NET.lock()
+        .as_ref()
+        .map(|n| n.mac_address())
+        .unwrap_or_default()
 }
 
 pub fn net_send(frame: &[u8]) -> Result<(), ()> {

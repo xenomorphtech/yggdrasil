@@ -22,7 +22,7 @@ use crate::{boot, mm};
 const STACK_ZONE_BASE: u64 = 0xffff_9000_0000_0000;
 /// VA stride per stack slot; the mapped stack sits at the top, all below is guard.
 const SLOT_STRIDE: u64 = 64 * 4096;
-pub const STACK_PAGES: u64 = 16; // 64 KiB usable stack
+pub const STACK_PAGES: u64 = 56; // 224 KiB usable stack (deep bytecode call chains)
 const MAX_SLOTS: u64 = 65536;
 
 unsafe extern "C" {
@@ -45,6 +45,12 @@ unsafe impl FrameAllocator<Size4KiB> for PmmFrames {
 }
 
 static MAPPER: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
+/// Physical address of our PML4 (APs load it into CR3 on entry).
+static PML4_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn pml4_phys() -> u64 {
+    PML4_PHYS.load(core::sync::atomic::Ordering::Relaxed)
+}
 static STACK_SLOTS: Mutex<SlotAllocator> = Mutex::new(SlotAllocator::new());
 
 struct SlotAllocator {
@@ -54,7 +60,10 @@ struct SlotAllocator {
 
 impl SlotAllocator {
     const fn new() -> Self {
-        Self { next: 0, freed: alloc::vec::Vec::new() }
+        Self {
+            next: 0,
+            freed: alloc::vec::Vec::new(),
+        }
     }
     fn alloc(&mut self) -> u64 {
         self.freed.pop().unwrap_or_else(|| {
@@ -89,7 +98,9 @@ pub fn init() {
         .map(|e| e.base + e.length)
         .max()
         .unwrap_or(0);
-    let top = ram_top.max(4 * 1024 * 1024 * 1024).next_multiple_of(2 * 1024 * 1024);
+    let top = ram_top
+        .max(4 * 1024 * 1024 * 1024)
+        .next_multiple_of(2 * 1024 * 1024);
     let hhdm_flags = F::PRESENT | F::WRITABLE | F::NO_EXECUTE | F::GLOBAL;
     for phys in (0..top).step_by(2 * 1024 * 1024) {
         let page = Page::<Size2MiB>::containing_address(VirtAddr::new(hhdm + phys));
@@ -103,7 +114,9 @@ pub fn init() {
     }
 
     // Kernel image with W^X, 4 KiB granularity.
-    let addr = boot::EXECUTABLE_ADDRESS.response().expect("no executable address");
+    let addr = boot::EXECUTABLE_ADDRESS
+        .response()
+        .expect("no executable address");
     let (vbase, pbase) = (addr.virtual_base, addr.physical_base);
     let sym = |s: &u8| VirtAddr::from_ptr(s).as_u64();
     let (image, text, rodata, data, end) = unsafe {
@@ -119,7 +132,11 @@ pub fn init() {
         (image, text, F::PRESENT | F::NO_EXECUTE | F::GLOBAL),
         (text, rodata, F::PRESENT | F::GLOBAL),
         (rodata, data, F::PRESENT | F::NO_EXECUTE | F::GLOBAL),
-        (data, end, F::PRESENT | F::WRITABLE | F::NO_EXECUTE | F::GLOBAL),
+        (
+            data,
+            end,
+            F::PRESENT | F::WRITABLE | F::NO_EXECUTE | F::GLOBAL,
+        ),
     ];
     for (start, stop, flags) in ranges {
         for va in (start..stop).step_by(4096) {
@@ -141,6 +158,7 @@ pub fn init() {
             x86_64::registers::control::Cr3Flags::empty(),
         );
     }
+    PML4_PHYS.store(pml4_phys, core::sync::atomic::Ordering::Relaxed);
     *MAPPER.lock() = Some(mapper);
     log::info!(
         "vmm: own page tables loaded (hhdm 2MiB x {}, image {:#x}..{:#x} W^X)",
@@ -167,7 +185,12 @@ pub fn map_stack() -> (u64, u64) {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(stack_base + i * 4096));
         unsafe {
             mapper
-                .map_to(page, frame, F::PRESENT | F::WRITABLE | F::NO_EXECUTE, &mut PmmFrames)
+                .map_to(
+                    page,
+                    frame,
+                    F::PRESENT | F::WRITABLE | F::NO_EXECUTE,
+                    &mut PmmFrames,
+                )
                 .expect("stack map failed")
                 .flush();
         }
@@ -178,7 +201,10 @@ pub fn map_stack() -> (u64, u64) {
 /// Translate any mapped virtual address via the live page tables.
 pub fn translate(virt: u64) -> Option<u64> {
     let guard = MAPPER.lock();
-    guard.as_ref()?.translate_addr(VirtAddr::new(virt)).map(|p| p.as_u64())
+    guard
+        .as_ref()?
+        .translate_addr(VirtAddr::new(virt))
+        .map(|p| p.as_u64())
 }
 
 /// JIT code zone: within ±2 GiB of the kernel image so PC-relative calls
@@ -216,11 +242,18 @@ pub fn unmap_stack(slot: u64) {
     let stack_base = slot_base + SLOT_STRIDE - STACK_PAGES * 4096;
     let mut guard = MAPPER.lock();
     let mapper = guard.as_mut().expect("vmm uninitialized");
+    let mut frames = [0u64; STACK_PAGES as usize];
     for i in 0..STACK_PAGES {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(stack_base + i * 4096));
         let (frame, flush) = mapper.unmap(page).expect("stack unmap failed");
         flush.flush();
-        mm::free_frames(frame.start_address().as_u64(), 1);
+        frames[i as usize] = frame.start_address().as_u64();
+    }
+    // Other cores may hold stale TLB entries for this VA range; flush them
+    // before the frames or the slot can be reused.
+    crate::smp::flush_broadcast();
+    for f in frames {
+        mm::free_frames(f, 1);
     }
     STACK_SLOTS.lock().freed.push(slot);
 }

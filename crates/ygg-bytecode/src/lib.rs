@@ -58,6 +58,31 @@ pub mod op {
     /// Resolves through the module table at call time — the hot-code-loading
     /// migration point (BEAM's fully-qualified call).
     pub const CALL_EXT: u8 = 27;
+    // Integer bit operations (ints only; trap otherwise). Shifts trap on
+    // amounts outside 0..=60 (i61 world; Erlang's negative-shift form is not
+    // supported).
+    pub const BAND: u8 = 28; // rd, ra, rb
+    pub const BOR: u8 = 29; //  rd, ra, rb
+    pub const BXOR: u8 = 30; // rd, ra, rb
+    pub const BSL: u8 = 31; //  rd, ra, rb
+    pub const BSR: u8 = 32; //  rd, ra, rb (arithmetic)
+    pub const BNOT: u8 = 33; // rd, rs
+    // Binaries.
+    pub const BIN_NEW: u8 = 34; //       rd, len:u32, len * byte (constant)
+    pub const BIN_FROM_LIST: u8 = 35; // rd, rs (list of ints 0..=255)
+    pub const BIN_TO_LIST: u8 = 36; //   rd, rs
+    pub const BIN_SIZE: u8 = 37; //      rd, rs
+    // Bridge between port buffer ids (ints) and binary terms.
+    pub const BUF_TO_BIN: u8 = 38; //    rd, rs (consumes the kernel buffer)
+    pub const BIN_TO_BUF: u8 = 39; //    rd, rs (new kernel buffer, returns id)
+    // Maps (flat, immediate keys — the struct/record representation).
+    pub const MAP_NEW: u8 = 40; //  rd, n:u8, n * (rkey, rval)
+    pub const MAP_GET: u8 = 41; //  rd, rmap, rkey (missing key traps)
+    pub const MAP_PUT: u8 = 42; //  rd, rmap, rkey, rval (functional update)
+    pub const IS_BINARY: u8 = 43; // rd, rs (int 1/0)
+    pub const BIN_CAT: u8 = 44; //  rd, ra, rb (binary append)
+    pub const LIST_CAT: u8 = 45; // rd, ra, rb (erlang ++: ra proper list)
+    pub const BIN_PART: u8 = 46; // rd, rbin, roff, rlen (bounds-checked slice)
 }
 
 #[derive(Debug, Clone)]
@@ -86,9 +111,11 @@ const MAGIC: &[u8; 6] = b"YGGM1\n";
 
 impl Module {
     pub fn function_named(&self, name: &str) -> Option<usize> {
-        self.functions
-            .iter()
-            .position(|f| self.atoms.get(f.name_atom as usize).is_some_and(|a| a == name))
+        self.functions.iter().position(|f| {
+            self.atoms
+                .get(f.name_atom as usize)
+                .is_some_and(|a| a == name)
+        })
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -129,7 +156,12 @@ impl Module {
             let arity = r.u8()?;
             let nregs = r.u8()?;
             let code_len = r.u32()? as usize;
-            functions.push(Function { name_atom, arity, nregs, code: r.take(code_len)?.to_vec() });
+            functions.push(Function {
+                name_atom,
+                arity,
+                nregs,
+                code: r.take(code_len)?.to_vec(),
+            });
         }
         Ok(Module { atoms, functions })
     }
@@ -186,6 +218,10 @@ impl CodeBuilder {
         self.code.extend_from_slice(&v.to_le_bytes());
         self
     }
+    pub fn bytes(&mut self, v: &[u8]) -> &mut Self {
+        self.code.extend_from_slice(v);
+        self
+    }
     /// Emit a jump-offset placeholder pointing at `label`.
     pub fn label_ref(&mut self, label: u32) -> &mut Self {
         self.fixups.push((self.code.len(), label));
@@ -216,7 +252,12 @@ mod tests {
     fn roundtrip() {
         let m = Module {
             atoms: vec!["main".into(), "hello".into()],
-            functions: vec![Function { name_atom: 0, arity: 1, nregs: 4, code: vec![1, 2, 3] }],
+            functions: vec![Function {
+                name_atom: 0,
+                arity: 1,
+                nregs: 4,
+                code: vec![1, 2, 3],
+            }],
         };
         let enc = m.encode();
         let d = Module::decode(&enc).unwrap();
@@ -228,10 +269,16 @@ mod tests {
 
     #[test]
     fn truncated_rejected() {
-        let m = Module { atoms: vec!["x".into()], functions: vec![] };
+        let m = Module {
+            atoms: vec!["x".into()],
+            functions: vec![],
+        };
         let enc = m.encode();
         for cut in 0..enc.len() {
-            assert!(Module::decode(&enc[..cut]).is_err(), "cut at {cut} accepted");
+            assert!(
+                Module::decode(&enc[..cut]).is_err(),
+                "cut at {cut} accepted"
+            );
         }
     }
 

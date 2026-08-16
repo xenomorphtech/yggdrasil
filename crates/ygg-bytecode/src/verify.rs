@@ -21,18 +21,49 @@ use crate::{Function, Module, op};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyError {
     /// Function's name atom is out of range.
-    BadFunctionName { fn_idx: usize },
+    BadFunctionName {
+        fn_idx: usize,
+    },
     /// arity > nregs (arguments wouldn't fit the frame).
-    ArityExceedsRegs { fn_idx: usize },
-    UnknownOpcode { fn_idx: usize, at: usize, opcode: u8 },
-    TruncatedInstruction { fn_idx: usize, at: usize },
-    BadRegister { fn_idx: usize, at: usize, reg: u8 },
-    BadAtom { fn_idx: usize, at: usize, atom: u32 },
-    BadJumpTarget { fn_idx: usize, at: usize },
-    BadCallTarget { fn_idx: usize, at: usize, callee: u32 },
-    BadCallArity { fn_idx: usize, at: usize },
+    ArityExceedsRegs {
+        fn_idx: usize,
+    },
+    UnknownOpcode {
+        fn_idx: usize,
+        at: usize,
+        opcode: u8,
+    },
+    TruncatedInstruction {
+        fn_idx: usize,
+        at: usize,
+    },
+    BadRegister {
+        fn_idx: usize,
+        at: usize,
+        reg: u8,
+    },
+    BadAtom {
+        fn_idx: usize,
+        at: usize,
+        atom: u32,
+    },
+    BadJumpTarget {
+        fn_idx: usize,
+        at: usize,
+    },
+    BadCallTarget {
+        fn_idx: usize,
+        at: usize,
+        callee: u32,
+    },
+    BadCallArity {
+        fn_idx: usize,
+        at: usize,
+    },
     /// Execution can run past the last instruction.
-    FallsOffEnd { fn_idx: usize },
+    FallsOffEnd {
+        fn_idx: usize,
+    },
 }
 
 pub fn verify(m: &Module) -> Result<(), VerifyError> {
@@ -54,7 +85,10 @@ impl<'a> Scan<'a> {
         let v = *self
             .code
             .get(self.at)
-            .ok_or(VerifyError::TruncatedInstruction { fn_idx: self.fn_idx, at: self.start })?;
+            .ok_or(VerifyError::TruncatedInstruction {
+                fn_idx: self.fn_idx,
+                at: self.start,
+            })?;
         self.at += 1;
         Ok(v)
     }
@@ -62,13 +96,19 @@ impl<'a> Scan<'a> {
         let s = self
             .code
             .get(self.at..self.at + 4)
-            .ok_or(VerifyError::TruncatedInstruction { fn_idx: self.fn_idx, at: self.start })?;
+            .ok_or(VerifyError::TruncatedInstruction {
+                fn_idx: self.fn_idx,
+                at: self.start,
+            })?;
         self.at += 4;
         Ok(u32::from_le_bytes(s.try_into().unwrap()))
     }
     fn skip(&mut self, n: usize) -> Result<(), VerifyError> {
         if self.at + n > self.code.len() {
-            return Err(VerifyError::TruncatedInstruction { fn_idx: self.fn_idx, at: self.start });
+            return Err(VerifyError::TruncatedInstruction {
+                fn_idx: self.fn_idx,
+                at: self.start,
+            });
         }
         self.at += n;
         Ok(())
@@ -86,12 +126,21 @@ fn verify_fn(m: &Module, fn_idx: usize, f: &Function) -> Result<(), VerifyError>
     let mut boundaries: BTreeSet<usize> = BTreeSet::new();
     // (jump-site, absolute target)
     let mut jump_targets: alloc::vec::Vec<(usize, i64)> = alloc::vec::Vec::new();
-    let mut s = Scan { code: &f.code, at: 0, start: 0, fn_idx };
+    let mut s = Scan {
+        code: &f.code,
+        at: 0,
+        start: 0,
+        fn_idx,
+    };
     // Whether the previous instruction allows falling into the next offset.
     let mut fell_through = true;
 
     let reg_ok = |r: u8, at: usize| {
-        if r >= f.nregs { Err(VerifyError::BadRegister { fn_idx, at, reg: r }) } else { Ok(()) }
+        if r >= f.nregs {
+            Err(VerifyError::BadRegister { fn_idx, at, reg: r })
+        } else {
+            Ok(())
+        }
     };
 
     while s.at < f.code.len() {
@@ -110,7 +159,11 @@ fn verify_fn(m: &Module, fn_idx: usize, f: &Function) -> Result<(), VerifyError>
                 reg_ok(s.u8()?, at)?;
                 let a = s.u32()?;
                 if m.atoms.get(a as usize).is_none() {
-                    return Err(VerifyError::BadAtom { fn_idx, at, atom: a });
+                    return Err(VerifyError::BadAtom {
+                        fn_idx,
+                        at,
+                        atom: a,
+                    });
                 }
             }
             op::LOAD_NIL | op::SELF_PID | op::RECV => {
@@ -199,7 +252,11 @@ fn verify_fn(m: &Module, fn_idx: usize, f: &Function) -> Result<(), VerifyError>
                 for _ in 0..2 {
                     let a = s.u32()?;
                     if m.atoms.get(a as usize).is_none() {
-                        return Err(VerifyError::BadAtom { fn_idx, at, atom: a });
+                        return Err(VerifyError::BadAtom {
+                            fn_idx,
+                            at,
+                            atom: a,
+                        });
                     }
                 }
                 // Target module/arity resolve at runtime (hot loading).
@@ -208,7 +265,52 @@ fn verify_fn(m: &Module, fn_idx: usize, f: &Function) -> Result<(), VerifyError>
                     reg_ok(s.u8()?, at)?;
                 }
             }
-            other => return Err(VerifyError::UnknownOpcode { fn_idx, at, opcode: other }),
+            op::BAND | op::BOR | op::BXOR | op::BSL | op::BSR => {
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+            }
+            op::BIN_CAT | op::LIST_CAT => {
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+            }
+            op::BNOT | op::BIN_FROM_LIST | op::BIN_TO_LIST | op::BIN_SIZE | op::BUF_TO_BIN
+            | op::BIN_TO_BUF | op::IS_BINARY => {
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+            }
+            op::BIN_NEW => {
+                reg_ok(s.u8()?, at)?;
+                let len = s.u32()? as usize;
+                s.skip(len)?;
+            }
+            op::MAP_NEW => {
+                reg_ok(s.u8()?, at)?;
+                let n = s.u8()?;
+                for _ in 0..n {
+                    reg_ok(s.u8()?, at)?;
+                    reg_ok(s.u8()?, at)?;
+                }
+            }
+            op::MAP_GET => {
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+            }
+            op::MAP_PUT | op::BIN_PART => {
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+                reg_ok(s.u8()?, at)?;
+            }
+            other => {
+                return Err(VerifyError::UnknownOpcode {
+                    fn_idx,
+                    at,
+                    opcode: other,
+                });
+            }
         }
     }
 
@@ -232,7 +334,12 @@ mod tests {
     fn module_with(code: alloc::vec::Vec<u8>, nregs: u8) -> Module {
         Module {
             atoms: vec!["main".into(), "x".into()],
-            functions: vec![Function { name_atom: 0, arity: 0, nregs, code }],
+            functions: vec![Function {
+                name_atom: 0,
+                arity: 0,
+                nregs,
+                code,
+            }],
         }
     }
 
@@ -254,7 +361,10 @@ mod tests {
         b.u8(op::LOAD_NIL).u8(9); // r9 with nregs=1
         b.u8(op::RET).u8(0);
         let m = module_with(b.finish().unwrap(), 1);
-        assert!(matches!(verify(&m), Err(VerifyError::BadRegister { reg: 9, .. })));
+        assert!(matches!(
+            verify(&m),
+            Err(VerifyError::BadRegister { reg: 9, .. })
+        ));
     }
 
     #[test]
@@ -277,9 +387,15 @@ mod tests {
     #[test]
     fn rejects_unknown_opcode_and_truncation() {
         let m = module_with(vec![0xEE], 1);
-        assert!(matches!(verify(&m), Err(VerifyError::UnknownOpcode { opcode: 0xEE, .. })));
+        assert!(matches!(
+            verify(&m),
+            Err(VerifyError::UnknownOpcode { opcode: 0xEE, .. })
+        ));
         let m = module_with(vec![op::LOAD_INT, 0, 1, 2], 1); // i64 cut short
-        assert!(matches!(verify(&m), Err(VerifyError::TruncatedInstruction { .. })));
+        assert!(matches!(
+            verify(&m),
+            Err(VerifyError::TruncatedInstruction { .. })
+        ));
     }
 
     #[test]
@@ -294,7 +410,10 @@ mod tests {
         b.u8(op::CALL).u8(0).u32(99).u8(0);
         b.u8(op::RET).u8(0);
         let m = module_with(b.finish().unwrap(), 1);
-        assert!(matches!(verify(&m), Err(VerifyError::BadCallTarget { callee: 99, .. })));
+        assert!(matches!(
+            verify(&m),
+            Err(VerifyError::BadCallTarget { callee: 99, .. })
+        ));
     }
 
     #[test]
@@ -303,7 +422,10 @@ mod tests {
         b.u8(op::LOAD_ATOM).u8(0).u32(1000);
         b.u8(op::RET).u8(0);
         let m = module_with(b.finish().unwrap(), 1);
-        assert!(matches!(verify(&m), Err(VerifyError::BadAtom { atom: 1000, .. })));
+        assert!(matches!(
+            verify(&m),
+            Err(VerifyError::BadAtom { atom: 1000, .. })
+        ));
     }
 
     /// Budget fuzzer: random mutations of a valid encoded module must never

@@ -81,7 +81,10 @@ fn assemble(src: &str) -> Result<Module> {
             let rest = rest.trim_end_matches('{').trim();
             let (sig, regs) = rest.split_once(" ").context("fn needs `regs=N`")?;
             let (name, arity) = sig.split_once('/').context("fn name needs /arity")?;
-            let nregs: u8 = regs.strip_prefix("regs=").context("expected regs=N")?.parse()?;
+            let nregs: u8 = regs
+                .strip_prefix("regs=")
+                .context("expected regs=N")?
+                .parse()?;
             cur = Some(FnDecl {
                 name: name.to_string(),
                 arity: arity.parse()?,
@@ -120,14 +123,13 @@ fn assemble(src: &str) -> Result<Module> {
             code,
         });
     }
-    Ok(Module { atoms: atoms.names, functions })
+    Ok(Module {
+        atoms: atoms.names,
+        functions,
+    })
 }
 
-fn assemble_fn(
-    d: &FnDecl,
-    fns: &HashMap<String, (u32, u8)>,
-    atoms: &mut Atoms,
-) -> Result<Vec<u8>> {
+fn assemble_fn(d: &FnDecl, fns: &HashMap<String, (u32, u8)>, atoms: &mut Atoms) -> Result<Vec<u8>> {
     let mut b = CodeBuilder::new();
     let mut labels: HashMap<String, u32> = HashMap::new();
     let mut next_label = 0u32;
@@ -144,15 +146,23 @@ fn assemble_fn(
             b.bind(id);
             continue;
         }
-        let (mnem, rest) = line.split_once(char::is_whitespace).unwrap_or((line.as_str(), ""));
-        let ops: Vec<&str> = rest.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let (mnem, rest) = line
+            .split_once(char::is_whitespace)
+            .unwrap_or((line.as_str(), ""));
+        let ops: Vec<&str> = rest
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
         let reg = |s: &str| -> Result<u8> {
             s.strip_prefix('r')
                 .and_then(|n| n.parse().ok())
                 .with_context(|| format!("line {ln}: bad register {s:?}"))
         };
         let fnref = |s: &str| -> Result<u32> {
-            fns.get(s).map(|(i, _)| *i).with_context(|| format!("line {ln}: unknown fn {s:?}"))
+            fns.get(s)
+                .map(|(i, _)| *i)
+                .with_context(|| format!("line {ln}: unknown fn {s:?}"))
         };
         match mnem {
             "nop" => {
@@ -175,16 +185,24 @@ fn assemble_fn(
                 b.u8(op::SELF_PID).u8(reg(ops[0])?);
             }
             "make_tuple" => {
-                b.u8(op::MAKE_TUPLE).u8(reg(ops[0])?).u8((ops.len() - 1) as u8);
+                b.u8(op::MAKE_TUPLE)
+                    .u8(reg(ops[0])?)
+                    .u8((ops.len() - 1) as u8);
                 for r in &ops[1..] {
                     b.u8(reg(r)?);
                 }
             }
             "get_elem" => {
-                b.u8(op::GET_ELEM).u8(reg(ops[0])?).u8(reg(ops[1])?).u8(ops[2].parse()?);
+                b.u8(op::GET_ELEM)
+                    .u8(reg(ops[0])?)
+                    .u8(reg(ops[1])?)
+                    .u8(ops[2].parse()?);
             }
             "cons" => {
-                b.u8(op::CONS).u8(reg(ops[0])?).u8(reg(ops[1])?).u8(reg(ops[2])?);
+                b.u8(op::CONS)
+                    .u8(reg(ops[0])?)
+                    .u8(reg(ops[1])?)
+                    .u8(reg(ops[2])?);
             }
             "head" => {
                 b.u8(op::HEAD).u8(reg(ops[0])?).u8(reg(ops[1])?);
@@ -211,7 +229,10 @@ fn assemble_fn(
                 b.u8(op::JMP_IF).u8(reg(ops[0])?).label_ref(id);
             }
             "call" => {
-                b.u8(op::CALL).u8(reg(ops[0])?).u32(fnref(ops[1])?).u8((ops.len() - 2) as u8);
+                b.u8(op::CALL)
+                    .u8(reg(ops[0])?)
+                    .u32(fnref(ops[1])?)
+                    .u8((ops.len() - 2) as u8);
                 for r in &ops[2..] {
                     b.u8(reg(r)?);
                 }
@@ -220,7 +241,10 @@ fn assemble_fn(
                 b.u8(op::RET).u8(reg(ops[0])?);
             }
             "spawn" => {
-                b.u8(op::SPAWN).u8(reg(ops[0])?).u32(fnref(ops[1])?).u8(reg(ops[2])?);
+                b.u8(op::SPAWN)
+                    .u8(reg(ops[0])?)
+                    .u32(fnref(ops[1])?)
+                    .u8(reg(ops[2])?);
             }
             "send" => {
                 b.u8(op::SEND).u8(reg(ops[0])?).u8(reg(ops[1])?);
@@ -241,7 +265,11 @@ fn assemble_fn(
                 // call_ext rd, module, fname, rArg...
                 let m = atoms.intern(ops[1]);
                 let f2 = atoms.intern(ops[2]);
-                b.u8(op::CALL_EXT).u8(reg(ops[0])?).u32(m).u32(f2).u8((ops.len() - 3) as u8);
+                b.u8(op::CALL_EXT)
+                    .u8(reg(ops[0])?)
+                    .u32(m)
+                    .u32(f2)
+                    .u8((ops.len() - 3) as u8);
                 for r in &ops[3..] {
                     b.u8(reg(r)?);
                 }
@@ -256,5 +284,6 @@ fn assemble_fn(
             _ => bail!("line {ln}: unknown mnemonic {mnem:?}"),
         }
     }
-    b.finish().map_err(|l| anyhow::anyhow!("unbound label id {l}"))
+    b.finish()
+        .map_err(|l| anyhow::anyhow!("unbound label id {l}"))
 }

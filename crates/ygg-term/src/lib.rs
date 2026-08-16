@@ -43,6 +43,11 @@ pub const TAG_PORT: u64 = 6;
 const KIND_TUPLE: u64 = 0;
 const KIND_CONS: u64 = 1;
 const KIND_BINARY: u64 = 2;
+/// Flat map: header (n pairs), n sorted keys, n values. Keys must be
+/// immediates (atoms/ints/pids…), sorted ascending by raw word so lookup is a
+/// binary search and copies preserve order. BEAM itself uses flat maps below
+/// 33 keys; structs stay far under that.
+const KIND_MAP: u64 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
@@ -59,6 +64,7 @@ pub enum Kind {
     Tuple,
     Cons,
     Binary,
+    Map,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +137,7 @@ impl Term {
                     KIND_TUPLE => Kind::Tuple,
                     KIND_CONS => Kind::Cons,
                     KIND_BINARY => Kind::Binary,
+                    KIND_MAP => Kind::Map,
                     k => unreachable!("bad box kind {k}"),
                 }
             }
@@ -162,6 +169,40 @@ impl Term {
             core::slice::from_raw_parts(self.ptr().add(1).cast::<u8>(), len)
         }
     }
+
+    /// # Safety: must be a map term into a live heap.
+    pub unsafe fn map_arity(self) -> usize {
+        unsafe { (*self.ptr() >> 3) as usize }
+    }
+    /// # Safety: must be a map term into a live heap; `i` < arity.
+    pub unsafe fn map_key(self, i: usize) -> Term {
+        Term(unsafe { *self.ptr().add(1 + i) })
+    }
+    /// # Safety: must be a map term into a live heap; `i` < arity.
+    pub unsafe fn map_val(self, i: usize) -> Term {
+        let n = unsafe { self.map_arity() };
+        Term(unsafe { *self.ptr().add(1 + n + i) })
+    }
+    /// Binary search by raw key word (keys are immediates).
+    /// # Safety: must be a map term into a live heap.
+    pub unsafe fn map_get(self, key: Term) -> Option<Term> {
+        unsafe {
+            let n = self.map_arity();
+            let (mut lo, mut hi) = (0usize, n);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let k = self.map_key(mid).0;
+                if k == key.0 {
+                    return Some(self.map_val(mid));
+                } else if k < key.0 {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Bump arena over caller-provided memory. Word-granular.
@@ -180,11 +221,23 @@ impl Heap {
     /// `base..base+bytes` must be writable, 8-aligned, and outlive the heap.
     pub unsafe fn new(base: *mut u8, bytes: usize) -> Heap {
         debug_assert_eq!(base as usize % 8, 0);
-        Heap { base: base.cast(), cap_words: bytes / 8, top: 0 }
+        Heap {
+            base: base.cast(),
+            cap_words: bytes / 8,
+            top: 0,
+        }
     }
 
     pub fn used_bytes(&self) -> usize {
         self.top * 8
+    }
+
+    /// Roll the bump pointer back to an earlier `used_bytes()` watermark.
+    /// Sound only when nothing published references the discarded terms
+    /// (e.g. undoing a speculative `copy_term` in selective receive).
+    pub fn truncate_to(&mut self, bytes: usize) {
+        debug_assert!(bytes % 8 == 0 && bytes / 8 <= self.top);
+        self.top = bytes / 8;
     }
     pub fn capacity_bytes(&self) -> usize {
         self.cap_words * 8
@@ -238,6 +291,60 @@ impl Heap {
         }
         Ok(t)
     }
+
+    /// Build a map from key/value pairs. Keys must be immediates; duplicate
+    /// keys keep the *last* value (map-literal semantics). Pairs are sorted
+    /// by raw key word in place.
+    pub fn map_from_pairs(&mut self, pairs: &mut [(Term, Term)]) -> Result<Term, MapError> {
+        if pairs.iter().any(|(k, _)| k.is_boxed()) {
+            return Err(MapError::NonImmediateKey);
+        }
+        // Stable sort so the last duplicate wins after the dedup pass.
+        pairs.sort_by_key(|(k, _)| k.0);
+        let mut n = 0usize;
+        for i in 0..pairs.len() {
+            if n > 0 && pairs[n - 1].0.0 == pairs[i].0.0 {
+                pairs[n - 1] = pairs[i];
+            } else {
+                pairs[n] = pairs[i];
+                n += 1;
+            }
+        }
+        let p = self.alloc(1 + 2 * n).map_err(MapError::Heap)?;
+        unsafe {
+            p.write(((n as u64) << 3) | KIND_MAP);
+            for (i, (k, v)) in pairs[..n].iter().enumerate() {
+                p.add(1 + i).write(k.0);
+                p.add(1 + n + i).write(v.0);
+            }
+        }
+        Ok(Term(p as u64))
+    }
+
+    /// New map = `base` with `key` set to `val`.
+    ///
+    /// # Safety
+    /// `base` must be a map term into a live heap.
+    pub unsafe fn map_put(&mut self, base: Term, key: Term, val: Term) -> Result<Term, MapError> {
+        if key.is_boxed() {
+            return Err(MapError::NonImmediateKey);
+        }
+        unsafe {
+            let n = base.map_arity();
+            let mut pairs: Vec<(Term, Term)> = Vec::with_capacity(n + 1);
+            for i in 0..n {
+                pairs.push((base.map_key(i), base.map_val(i)));
+            }
+            pairs.push((key, val));
+            self.map_from_pairs(&mut pairs)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapError {
+    Heap(HeapFull),
+    NonImmediateKey,
 }
 
 /// Deep-copy `src` (whose boxed parts live in some other live heap) into `dst`.
@@ -263,6 +370,21 @@ pub unsafe fn copy_term(src: Term, dst: &mut Heap) -> Result<Term, HeapFull> {
                 Ok(Term(p as u64))
             }
             Kind::Binary => dst.binary(src.bin_bytes()),
+            Kind::Map => {
+                // Keys are immediates: order is preserved across heaps, so the
+                // layout copies verbatim with recursed values.
+                let n = src.map_arity();
+                let p = dst.alloc(1 + 2 * n)?;
+                p.write(((n as u64) << 3) | KIND_MAP);
+                for i in 0..n {
+                    p.add(1 + i).write(src.map_key(i).0);
+                }
+                for i in 0..n {
+                    let v = copy_term(src.map_val(i), dst)?;
+                    p.add(1 + n + i).write(v.0);
+                }
+                Ok(Term(p as u64))
+            }
             Kind::Cons => {
                 // Iterate the spine; patch each new cell's tail as we go.
                 let mut spine: Vec<Term> = Vec::new();
@@ -277,6 +399,37 @@ pub unsafe fn copy_term(src: Term, dst: &mut Heap) -> Result<Term, HeapFull> {
                     tail = dst.cons(h, tail)?;
                 }
                 Ok(tail)
+            }
+        }
+    }
+}
+
+/// Heap words needed to deep-copy `t` (matches `copy_term`'s allocations).
+/// List spines are walked iteratively, mirroring `copy_term`.
+///
+/// # Safety
+/// All boxed parts of `t` must point into live heap memory.
+pub unsafe fn term_size_words(t: Term) -> usize {
+    unsafe {
+        match t.kind() {
+            Kind::Int | Kind::Atom | Kind::Pid | Kind::Ref | Kind::Nil | Kind::Port => 0,
+            Kind::Tuple => {
+                let n = t.tuple_arity();
+                1 + n + (0..n).map(|i| term_size_words(t.tuple_elem(i))).sum::<usize>()
+            }
+            Kind::Binary => 1 + t.bin_bytes().len().div_ceil(8),
+            Kind::Map => {
+                let n = t.map_arity();
+                1 + 2 * n + (0..n).map(|i| term_size_words(t.map_val(i))).sum::<usize>()
+            }
+            Kind::Cons => {
+                let mut words = 0;
+                let mut cur = t;
+                while cur.kind() == Kind::Cons {
+                    words += 3 + term_size_words(cur.head());
+                    cur = cur.tail();
+                }
+                words + term_size_words(cur)
             }
         }
     }
@@ -300,6 +453,13 @@ pub unsafe fn eq(a: Term, b: Term) -> bool {
                 n == b.tuple_arity() && (0..n).all(|i| eq(a.tuple_elem(i), b.tuple_elem(i)))
             }
             (Kind::Binary, Kind::Binary) => a.bin_bytes() == b.bin_bytes(),
+            (Kind::Map, Kind::Map) => {
+                let n = a.map_arity();
+                n == b.map_arity()
+                    && (0..n).all(|i| {
+                        a.map_key(i) == b.map_key(i) && eq(a.map_val(i), b.map_val(i))
+                    })
+            }
             (Kind::Cons, Kind::Cons) => {
                 let (mut x, mut y) = (a, b);
                 loop {
@@ -338,6 +498,18 @@ pub unsafe fn fmt_term(
             Kind::Port => write!(out, "#port<{}>", t.as_port().unwrap()),
             Kind::Nil => write!(out, "[]"),
             Kind::Binary => write!(out, "<<{} bytes>>", t.bin_bytes().len()),
+            Kind::Map => {
+                write!(out, "#{{")?;
+                for i in 0..t.map_arity() {
+                    if i > 0 {
+                        write!(out, ", ")?;
+                    }
+                    fmt_term(t.map_key(i), out, atom_name)?;
+                    write!(out, " => ")?;
+                    fmt_term(t.map_val(i), out, atom_name)?;
+                }
+                write!(out, "}}")
+            }
             Kind::Tuple => {
                 write!(out, "{{")?;
                 for i in 0..t.tuple_arity() {

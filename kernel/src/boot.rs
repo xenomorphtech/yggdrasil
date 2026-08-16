@@ -3,9 +3,10 @@
 //! Every request lives in the `.limine_requests` section between the start/end
 //! markers; the linker script keeps them and the bootloader scans the section.
 
+use limine::mp::MP_FLAG_X2APIC;
 use limine::request::{
-    ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest, MemmapRequest,
-    ModulesRequest, RsdpRequest, StackSizeRequest,
+    ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest, MemmapRequest, ModulesRequest,
+    MpRequest, RsdpRequest, StackSizeRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
@@ -45,6 +46,10 @@ pub static CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 pub static MODULES: ModulesRequest = ModulesRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static MP: MpRequest = MpRequest::new(MP_FLAG_X2APIC);
 
 #[used]
 #[unsafe(link_section = ".limine_requests_end")]

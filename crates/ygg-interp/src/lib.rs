@@ -54,8 +54,11 @@ pub trait SystemApi {
     fn port_submit(&mut self, port: Term, op: u8, arg0: Term, tag: Term) -> Result<(), Trap>;
     /// Fully-qualified call: resolve `module:fname/args.len()` in the *current*
     /// module table and run it. Atoms are global indices.
-    fn call_ext(&mut self, module_atom: u32, fname_atom: u32, args: &[Term])
-    -> Result<Term, Trap>;
+    fn call_ext(&mut self, module_atom: u32, fname_atom: u32, args: &[Term]) -> Result<Term, Trap>;
+    /// Consume kernel packet buffer `id`, producing a binary term.
+    fn buf_to_bin(&mut self, id: i64) -> Result<Term, Trap>;
+    /// Create a kernel packet buffer from a binary; returns its id as an int term.
+    fn bin_to_buf(&mut self, bin: Term) -> Result<Term, Trap>;
 }
 
 struct Frame<'m> {
@@ -83,6 +86,11 @@ impl<'m> Frame<'m> {
         self.pc += 8;
         Ok(i64::from_le_bytes(s.try_into().unwrap()))
     }
+    fn bytes(&mut self, n: usize) -> Result<&'m [u8], Trap> {
+        let s = self.code.get(self.pc..self.pc + n).ok_or(Trap::BadCode)?;
+        self.pc += n;
+        Ok(s)
+    }
     fn get(&self, r: u8) -> Result<Term, Trap> {
         self.regs.get(r as usize).copied().ok_or(Trap::Badarg)
     }
@@ -103,7 +111,11 @@ pub fn run_function(
     if args.len() != f.arity as usize || (f.nregs as usize) < args.len() {
         return Err(Trap::Badarg);
     }
-    let mut fr = Frame { code: &f.code, pc: 0, regs: vec![Term::NIL; f.nregs as usize] };
+    let mut fr = Frame {
+        code: &f.code,
+        pc: 0,
+        regs: vec![Term::NIL; f.nregs as usize],
+    };
     fr.regs[..args.len()].copy_from_slice(args);
 
     loop {
@@ -176,7 +188,11 @@ pub fn run_function(
                     if t.kind() != ygg_term::Kind::Cons {
                         return Err(Trap::Badarg);
                     }
-                    if opcode == op::HEAD { t.head() } else { t.tail() }
+                    if opcode == op::HEAD {
+                        t.head()
+                    } else {
+                        t.tail()
+                    }
                 };
                 fr.set(rd, v)?;
             }
@@ -302,8 +318,225 @@ pub fn run_function(
                 let v = api.call_ext(mg, fg, &args)?;
                 fr.set(rd, v)?;
             }
+            op::BAND | op::BOR | op::BXOR => {
+                let rd = fr.u8()?;
+                let ra = fr.u8()?;
+                let rb = fr.u8()?;
+                let a = fr.get(ra)?.as_int().ok_or(Trap::Badarg)?;
+                let b = fr.get(rb)?.as_int().ok_or(Trap::Badarg)?;
+                let v = match opcode {
+                    op::BAND => a & b,
+                    op::BOR => a | b,
+                    _ => a ^ b,
+                };
+                fr.set(rd, Term::int(v))?;
+            }
+            op::BSL | op::BSR => {
+                let rd = fr.u8()?;
+                let ra = fr.u8()?;
+                let rb = fr.u8()?;
+                let a = fr.get(ra)?.as_int().ok_or(Trap::Badarg)?;
+                let b = fr.get(rb)?.as_int().ok_or(Trap::Badarg)?;
+                if !(0..=60).contains(&b) {
+                    return Err(Trap::Badarg);
+                }
+                let v = if opcode == op::BSL { a.wrapping_shl(b as u32) } else { a >> b };
+                fr.set(rd, Term::int(((v << 3) >> 3)))?; // clamp into i61
+            }
+            op::BNOT => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let a = fr.get(rs)?.as_int().ok_or(Trap::Badarg)?;
+                fr.set(rd, Term::int(!a))?;
+            }
+            op::BIN_NEW => {
+                let rd = fr.u8()?;
+                let len = fr.u32()? as usize;
+                let bytes = fr.bytes(len)?;
+                let b = api.heap().binary(bytes)?;
+                fr.set(rd, b)?;
+            }
+            op::BIN_FROM_LIST => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let mut cur = fr.get(rs)?;
+                let mut bytes: Vec<u8> = Vec::new();
+                unsafe {
+                    while cur.kind() == ygg_term::Kind::Cons {
+                        let h = cur.head().as_int().ok_or(Trap::Badarg)?;
+                        if !(0..=255).contains(&h) {
+                            return Err(Trap::Badarg);
+                        }
+                        bytes.push(h as u8);
+                        cur = cur.tail();
+                    }
+                }
+                if !cur.is_nil() {
+                    return Err(Trap::Badarg);
+                }
+                let b = api.heap().binary(&bytes)?;
+                fr.set(rd, b)?;
+            }
+            op::BIN_TO_LIST => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let t = fr.get(rs)?;
+                let elems: Vec<Term> = unsafe {
+                    if t.kind() != ygg_term::Kind::Binary {
+                        return Err(Trap::Badarg);
+                    }
+                    t.bin_bytes().iter().map(|&b| Term::int(b as i64)).collect()
+                };
+                let l = api.heap().list(&elems)?;
+                fr.set(rd, l)?;
+            }
+            op::BIN_SIZE => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let t = fr.get(rs)?;
+                let n = unsafe {
+                    if t.kind() != ygg_term::Kind::Binary {
+                        return Err(Trap::Badarg);
+                    }
+                    t.bin_bytes().len()
+                };
+                fr.set(rd, Term::int(n as i64))?;
+            }
+            op::BUF_TO_BIN => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let id = fr.get(rs)?.as_int().ok_or(Trap::Badarg)?;
+                let b = api.buf_to_bin(id)?;
+                fr.set(rd, b)?;
+            }
+            op::BIN_TO_BUF => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let b = fr.get(rs)?;
+                let id = api.bin_to_buf(b)?;
+                fr.set(rd, id)?;
+            }
+            op::IS_BINARY => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let t = fr.get(rs)?;
+                let is = unsafe { t.is_boxed() && t.kind() == ygg_term::Kind::Binary };
+                fr.set(rd, Term::int(is as i64))?;
+            }
+            op::BIN_CAT => {
+                let rd = fr.u8()?;
+                let ra = fr.u8()?;
+                let rb = fr.u8()?;
+                let (a, b) = (fr.get(ra)?, fr.get(rb)?);
+                let joined: Vec<u8> = unsafe {
+                    if !a.is_boxed()
+                        || a.kind() != ygg_term::Kind::Binary
+                        || !b.is_boxed()
+                        || b.kind() != ygg_term::Kind::Binary
+                    {
+                        return Err(Trap::Badarg);
+                    }
+                    let mut v = a.bin_bytes().to_vec();
+                    v.extend_from_slice(b.bin_bytes());
+                    v
+                };
+                let out = api.heap().binary(&joined)?;
+                fr.set(rd, out)?;
+            }
+            op::LIST_CAT => {
+                let rd = fr.u8()?;
+                let ra = fr.u8()?;
+                let rb = fr.u8()?;
+                let (a, b) = (fr.get(ra)?, fr.get(rb)?);
+                let mut elems: Vec<Term> = Vec::new();
+                let mut cur = a;
+                unsafe {
+                    while cur.is_boxed() && cur.kind() == ygg_term::Kind::Cons {
+                        elems.push(cur.head());
+                        cur = cur.tail();
+                    }
+                }
+                if !cur.is_nil() {
+                    return Err(Trap::Badarg);
+                }
+                let mut out = b;
+                for e in elems.into_iter().rev() {
+                    out = api.heap().cons(e, out)?;
+                }
+                fr.set(rd, out)?;
+            }
+            op::BIN_PART => {
+                let rd = fr.u8()?;
+                let rb = fr.u8()?;
+                let ro = fr.u8()?;
+                let rl = fr.u8()?;
+                let b = fr.get(rb)?;
+                let off = fr.get(ro)?.as_int().ok_or(Trap::Badarg)?;
+                let len = fr.get(rl)?.as_int().ok_or(Trap::Badarg)?;
+                let part: Vec<u8> = unsafe {
+                    if !b.is_boxed() || b.kind() != ygg_term::Kind::Binary || off < 0 || len < 0 {
+                        return Err(Trap::Badarg);
+                    }
+                    let bytes = b.bin_bytes();
+                    let (off, len) = (off as usize, len as usize);
+                    if off + len > bytes.len() {
+                        return Err(Trap::Badarg);
+                    }
+                    bytes[off..off + len].to_vec()
+                };
+                let out = api.heap().binary(&part)?;
+                fr.set(rd, out)?;
+            }
+            op::MAP_NEW => {
+                let rd = fr.u8()?;
+                let n = fr.u8()? as usize;
+                let mut pairs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let rk = fr.u8()?;
+                    let rv = fr.u8()?;
+                    pairs.push((fr.get(rk)?, fr.get(rv)?));
+                }
+                let m = api.heap().map_from_pairs(&mut pairs).map_err(map_err)?;
+                fr.set(rd, m)?;
+            }
+            op::MAP_GET => {
+                let rd = fr.u8()?;
+                let rm = fr.u8()?;
+                let rk = fr.u8()?;
+                let m = fr.get(rm)?;
+                let k = fr.get(rk)?;
+                let v = unsafe {
+                    if !m.is_boxed() || m.kind() != ygg_term::Kind::Map {
+                        return Err(Trap::Badarg);
+                    }
+                    m.map_get(k).ok_or(Trap::Badarg)?
+                };
+                fr.set(rd, v)?;
+            }
+            op::MAP_PUT => {
+                let rd = fr.u8()?;
+                let rm = fr.u8()?;
+                let rk = fr.u8()?;
+                let rv = fr.u8()?;
+                let m = fr.get(rm)?;
+                let (k, v) = (fr.get(rk)?, fr.get(rv)?);
+                unsafe {
+                    if !m.is_boxed() || m.kind() != ygg_term::Kind::Map {
+                        return Err(Trap::Badarg);
+                    }
+                    let out = api.heap().map_put(m, k, v).map_err(map_err)?;
+                    fr.set(rd, out)?;
+                }
+            }
             _ => return Err(Trap::BadCode),
         }
+    }
+}
+
+fn map_err(e: ygg_term::MapError) -> Trap {
+    match e {
+        ygg_term::MapError::Heap(_) => Trap::HeapFull,
+        ygg_term::MapError::NonImmediateKey => Trap::Badarg,
     }
 }
 
@@ -336,6 +569,7 @@ mod tests {
         printed: Vec<String>,
         spawned: Vec<(u32, Term)>,
         safepoints: usize,
+        buffers: alloc::collections::BTreeMap<i64, Vec<u8>>,
     }
 
     impl MockApi {
@@ -349,6 +583,7 @@ mod tests {
                 printed: Vec::new(),
                 spawned: Vec::new(),
                 safepoints: 0,
+                buffers: alloc::collections::BTreeMap::new(),
             })
         }
     }
@@ -367,7 +602,9 @@ mod tests {
             Ok(())
         }
         fn recv(&mut self) -> Term {
-            self.mailbox.pop_front().expect("mock recv on empty mailbox")
+            self.mailbox
+                .pop_front()
+                .expect("mock recv on empty mailbox")
         }
         fn spawn(&mut self, fn_idx: u32, arg: Term) -> Result<u64, Trap> {
             self.spawned.push((fn_idx, arg));
@@ -402,6 +639,21 @@ mod tests {
         ) -> Result<Term, Trap> {
             Err(Trap::Badarg) // no module table in the mock
         }
+        fn buf_to_bin(&mut self, id: i64) -> Result<Term, Trap> {
+            let data = self.buffers.remove(&id).ok_or(Trap::Badarg)?;
+            Ok(self.heap.binary(&data)?)
+        }
+        fn bin_to_buf(&mut self, bin: Term) -> Result<Term, Trap> {
+            let bytes = unsafe {
+                if bin.kind() != ygg_term::Kind::Binary {
+                    return Err(Trap::Badarg);
+                }
+                bin.bin_bytes().to_vec()
+            };
+            let id = 900 + self.buffers.len() as i64;
+            self.buffers.insert(id, bytes);
+            Ok(Term::int(id))
+        }
     }
 
     /// fact(n) = n <= 1 ? 1 : n * fact(n - 1)
@@ -422,7 +674,12 @@ mod tests {
         b.u8(op::RET).u8(5);
         Module {
             atoms: vec!["fact".into()],
-            functions: vec![Function { name_atom: 0, arity: 1, nregs: 6, code: b.finish().unwrap() }],
+            functions: vec![Function {
+                name_atom: 0,
+                arity: 1,
+                nregs: 6,
+                code: b.finish().unwrap(),
+            }],
         }
     }
 
@@ -461,7 +718,12 @@ mod tests {
         b.u8(op::RET).u8(8);
         let m = Module {
             atoms: vec!["main".into()],
-            functions: vec![Function { name_atom: 0, arity: 0, nregs: 9, code: b.finish().unwrap() }],
+            functions: vec![Function {
+                name_atom: 0,
+                arity: 0,
+                nregs: 9,
+                code: b.finish().unwrap(),
+            }],
         };
         let mut api = MockApi::new();
         let r = run_function(&m, 0, &[], &mut *api).unwrap();
@@ -482,16 +744,32 @@ mod tests {
         b.u8(op::HEAD).u8(1).u8(0);
         let m = Module {
             atoms: vec!["t".into()],
-            functions: vec![Function { name_atom: 0, arity: 0, nregs: 2, code: b.finish().unwrap() }],
+            functions: vec![Function {
+                name_atom: 0,
+                arity: 0,
+                nregs: 2,
+                code: b.finish().unwrap(),
+            }],
         };
-        assert_eq!(run_function(&m, 0, &[], &mut *MockApi::new()), Err(Trap::Badarg));
+        assert_eq!(
+            run_function(&m, 0, &[], &mut *MockApi::new()),
+            Err(Trap::Badarg)
+        );
 
         // Truncated code traps BadCode.
         let m2 = Module {
             atoms: vec!["t".into()],
-            functions: vec![Function { name_atom: 0, arity: 0, nregs: 1, code: vec![op::LOAD_INT, 0] }],
+            functions: vec![Function {
+                name_atom: 0,
+                arity: 0,
+                nregs: 1,
+                code: vec![op::LOAD_INT, 0],
+            }],
         };
-        assert_eq!(run_function(&m2, 0, &[], &mut *MockApi::new()), Err(Trap::BadCode));
+        assert_eq!(
+            run_function(&m2, 0, &[], &mut *MockApi::new()),
+            Err(Trap::BadCode)
+        );
 
         // ExitAtom surfaces the global atom.
         let mut b3 = CodeBuilder::new();
@@ -499,8 +777,16 @@ mod tests {
         b3.u8(op::EXIT_ATOM).u8(0);
         let m3 = Module {
             atoms: vec!["t".into()],
-            functions: vec![Function { name_atom: 0, arity: 0, nregs: 1, code: b3.finish().unwrap() }],
+            functions: vec![Function {
+                name_atom: 0,
+                arity: 0,
+                nregs: 1,
+                code: b3.finish().unwrap(),
+            }],
         };
-        assert_eq!(run_function(&m3, 0, &[], &mut *MockApi::new()), Err(Trap::Exit(1004)));
+        assert_eq!(
+            run_function(&m3, 0, &[], &mut *MockApi::new()),
+            Err(Trap::Exit(1004))
+        );
     }
 }

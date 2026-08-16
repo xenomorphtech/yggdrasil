@@ -9,11 +9,22 @@ use x86_64::instructions::port::Port;
 use x86_64::structures::idt::InterruptStackFrame;
 
 pub const TIMER_VECTOR: u8 = 0x40;
+/// Wake an idle (hlt-parked) core; handler is EOI-only.
+pub const WAKE_VECTOR: u8 = 0x41;
+/// TLB shootdown: reload CR3, ack, EOI.
+pub const TLB_FLUSH_VECTOR: u8 = 0x42;
+/// Panic path: stop all other cores.
+pub const HALT_VECTOR: u8 = 0x43;
 pub const SERIAL_VECTOR: u8 = 0x44;
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
+/// Acks for an in-flight TLB shootdown.
+pub static TLB_ACKS: AtomicUsize = AtomicUsize::new(0);
+
 /// Milliseconds since timer start (1 kHz).
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// BSP-calibrated LAPIC timer ticks per millisecond (divide 16).
+static TICKS_PER_MS: AtomicUsize = AtomicUsize::new(0);
 /// 0 = x2APIC (MSR access); nonzero = xAPIC MMIO base (HHDM-virtual).
 ///
 /// x2APIC is preferred because MSR access needs no page mapping — Limine's HHDM
@@ -97,11 +108,26 @@ pub fn init() {
     lapic_write(reg::TPR, 0);
 
     let per_ms = calibrate_timer();
+    TICKS_PER_MS.store(per_ms as usize, Ordering::Relaxed);
     log::info!("lapic: timer calibrated, {per_ms} ticks/ms (divide 16)");
 
     // Periodic (bit 17), 1 kHz.
     lapic_write(reg::LVT_TIMER, (1 << 17) | TIMER_VECTOR as u32);
     lapic_write(reg::TIMER_INIT, per_ms);
+}
+
+/// Per-AP LAPIC setup: x2APIC on, timer running with the BSP's calibration.
+pub fn init_ap() {
+    unsafe {
+        let mut msr = x86_64::registers::model_specific::Msr::new(IA32_APIC_BASE);
+        let v = msr.read();
+        msr.write(v | (1 << 11) | (1 << 10));
+    }
+    lapic_write(reg::SVR, 0x100 | SPURIOUS_VECTOR as u32);
+    lapic_write(reg::TPR, 0);
+    lapic_write(reg::TIMER_DIVIDE, 0b0011);
+    lapic_write(reg::LVT_TIMER, (1 << 17) | TIMER_VECTOR as u32);
+    lapic_write(reg::TIMER_INIT, TICKS_PER_MS.load(Ordering::Relaxed) as u32);
 }
 
 /// Device interrupt routing. Requires our own page tables (IOAPIC is MMIO,
@@ -143,8 +169,12 @@ fn calibrate_timer() -> u32 {
 }
 
 pub extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
-    TICKS.fetch_add(1, Ordering::Relaxed);
-    crate::proc::PREEMPT.store(true, Ordering::Relaxed);
+    let cpu = crate::percpu::cpu();
+    // Only the BSP advances the wall clock; every core preempts itself.
+    if cpu.id == 0 {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    cpu.preempt.store(true, Ordering::Relaxed);
     eoi();
 }
 
@@ -155,6 +185,46 @@ pub extern "x86-interrupt" fn serial_interrupt(_frame: InterruptStackFrame) {
 
 pub extern "x86-interrupt" fn spurious_interrupt(_frame: InterruptStackFrame) {
     // No EOI for spurious interrupts.
+}
+
+pub extern "x86-interrupt" fn wake_interrupt(_frame: InterruptStackFrame) {
+    // Its only job is to break `hlt` on an idle core.
+    eoi();
+}
+
+pub extern "x86-interrupt" fn tlb_flush_interrupt(_frame: InterruptStackFrame) {
+    // Reload CR3: flushes all non-global TLB entries (stack zone is
+    // non-global; kernel image/HHDM are GLOBAL and survive).
+    unsafe {
+        let (frame, flags) = x86_64::registers::control::Cr3::read();
+        x86_64::registers::control::Cr3::write(frame, flags);
+    }
+    TLB_ACKS.fetch_add(1, Ordering::Release);
+    eoi();
+}
+
+pub extern "x86-interrupt" fn halt_interrupt(_frame: InterruptStackFrame) {
+    loop {
+        x86_64::instructions::interrupts::disable();
+        x86_64::instructions::hlt();
+    }
+}
+
+/// x2APIC ICR: fixed-delivery IPI to every core except this one.
+pub fn ipi_all_others(vector: u8) {
+    // Destination shorthand 0b11 = all excluding self.
+    unsafe {
+        x86_64::registers::model_specific::Msr::new(X2APIC_MSR_BASE + 0x30)
+            .write((0b11 << 18) | vector as u64);
+    }
+}
+
+/// x2APIC ICR: fixed-delivery IPI to one core by lapic id.
+pub fn ipi(lapic_id: u32, vector: u8) {
+    unsafe {
+        x86_64::registers::model_specific::Msr::new(X2APIC_MSR_BASE + 0x30)
+            .write(((lapic_id as u64) << 32) | vector as u64);
+    }
 }
 
 /// Route an ISA IRQ through the IOAPIC to `vector` on the BSP

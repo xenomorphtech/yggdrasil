@@ -13,11 +13,13 @@ mod irq;
 mod jit;
 mod mm;
 mod modload;
+mod percpu;
 mod ports;
 mod proc;
 mod qemu;
 mod selftest;
 mod serial;
+mod smp;
 mod virtio;
 mod vmm;
 
@@ -38,6 +40,13 @@ extern "C" fn kmain() -> ! {
         limine::BaseRevision::MAX_SUPPORTED
     );
 
+    // Per-CPU table + gs binding first: exception/interrupt paths use cpu().
+    let (cpu_count, bsp_lapic) = boot::MP
+        .response()
+        .map(|r| (r.cpus().len().max(1), r.bsp_lapic_id))
+        .unwrap_or((1, 0));
+    percpu::init(cpu_count, bsp_lapic);
+    percpu::bind(percpu::all()[0]);
     gdt::init();
     idt::init();
 
@@ -49,6 +58,7 @@ extern "C" fn kmain() -> ! {
     vmm::init();
     irq::init_devices();
     virtio::init();
+    smp::init();
     x86_64::instructions::interrupts::enable();
 
     let has_arg = |w: &str| boot::cmdline().split_whitespace().any(|a| a == w);
@@ -115,6 +125,7 @@ fn report_boot_info() {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    smp::halt_others();
     x86_64::instructions::interrupts::disable();
     let mut out = unsafe { serial::force_writer() };
     let _ = writeln!(out, "\nKERNEL PANIC: {info}");
