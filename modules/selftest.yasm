@@ -1,0 +1,68 @@
+module selftest
+; M3.5 acceptance module.
+; main/1 gets the native parent's pid. It spawns a busy loop (which can only
+; be descheduled by back-edge safepoint preemption), then ping-pongs five
+; rounds with pong/1, prints each reply, tells the parent it's done, and exits.
+
+fn main/1 regs=12 {
+    spawn r1, busy/1, r0
+    self r2
+    spawn r3, pong/1, r2
+    load_int r4, 1
+    load_int r5, 6
+loop:
+    send r3, r4
+    recv r6
+    print r6
+    load_int r7, 1
+    add r4, r4, r7
+    lt r8, r4, r5
+    jmp_if r8, loop
+    load_atom r9, bc_done
+    send r0, r9
+    load_atom r10, normal
+    exit_atom r10
+}
+
+; r0 = peer pid; echo each int + 100 forever
+fn pong/1 regs=6 {
+loop:
+    recv r1
+    load_int r2, 100
+    add r3, r1, r2
+    send r0, r3
+    jmp loop
+}
+
+; never yields voluntarily; only back-edge safepoints let others run
+fn busy/1 regs=4 {
+    load_int r1, 0
+    load_int r2, 1
+loop:
+    add r1, r1, r2
+    jmp loop
+}
+
+; r0 = native parent pid. Serves the serial port through SQ/CQ rings:
+; echo every received byte, stop at newline (10), then report to parent.
+fn echo/1 regs=12 {
+    port_open r1, 0
+    load_atom r2, echo_ready
+    print r2
+    load_int r5, 0              ; read tag 0 (also unused arg0)
+    load_int r11, -1            ; SKIP_CQE for writes
+loop:
+    port_submit r1, 2, r5, r5   ; READ
+    recv r6                     ; {port_reply, Port, Tag, Result}
+    get_elem r7, r6, 3          ; the byte
+    port_submit r1, 1, r7, r11  ; WRITE it back, no completion
+    load_int r8, 10
+    eq r9, r7, r8
+    jmp_if r9, done
+    jmp loop
+done:
+    load_atom r10, bc_echo_done
+    send r0, r10
+    load_atom r4, normal
+    exit_atom r4
+}

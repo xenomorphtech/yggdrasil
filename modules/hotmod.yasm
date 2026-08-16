@@ -1,0 +1,10 @@
+module hotmod
+; Loaded at *runtime* from the storage port (not a boot module):
+; greets the parent and exits.
+
+fn main/1 regs=4 {
+    load_atom r1, hot_hello
+    send r0, r1
+    load_atom r2, normal
+    exit_atom r2
+}

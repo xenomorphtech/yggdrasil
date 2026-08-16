@@ -1,0 +1,122 @@
+#![no_std]
+#![no_main]
+#![feature(abi_x86_interrupt)]
+
+extern crate alloc;
+
+mod acpi_tables;
+mod atoms;
+mod boot;
+mod gdt;
+mod idt;
+mod irq;
+mod jit;
+mod mm;
+mod modload;
+mod ports;
+mod proc;
+mod qemu;
+mod selftest;
+mod serial;
+mod virtio;
+mod vmm;
+
+use core::fmt::Write;
+use core::panic::PanicInfo;
+
+use limine::memmap::MEMMAP_USABLE;
+
+#[unsafe(no_mangle)]
+extern "C" fn kmain() -> ! {
+    serial::init();
+    println!();
+    println!("Yggdrasil 0.1.0 — BEAM-like OS, booting");
+
+    assert!(
+        boot::BASE_REVISION.is_supported(),
+        "limine base revision {} not supported by bootloader",
+        limine::BaseRevision::MAX_SUPPORTED
+    );
+
+    gdt::init();
+    idt::init();
+
+    report_boot_info();
+
+    mm::init();
+    acpi_tables::init();
+    irq::init();
+    vmm::init();
+    irq::init_devices();
+    virtio::init();
+    x86_64::instructions::interrupts::enable();
+
+    let has_arg = |w: &str| boot::cmdline().split_whitespace().any(|a| a == w);
+    if has_arg("selftest") {
+        selftest::early();
+        proc::spawn(selftest::proc_tests, 0);
+    } else if has_arg("verify-disk") {
+        proc::spawn(selftest::verify_disk, 0);
+    } else {
+        println!("boot complete; starting init process");
+        proc::spawn(init_process, 0);
+    }
+    proc::run()
+}
+
+/// Placeholder init: keeps the system visibly alive until real modules exist.
+extern "C" fn init_process(_arg: u64) {
+    let mut last_s = 0;
+    loop {
+        x86_64::instructions::hlt();
+        proc::safepoint();
+        let s = irq::ticks() / 1000;
+        if s > last_s {
+            last_s = s;
+            println!("[time] uptime {s} s");
+        }
+    }
+}
+
+fn report_boot_info() {
+    let hhdm = boot::HHDM.response().expect("limine: no HHDM response");
+    println!("[boot] hhdm offset      = {:#x}", hhdm.offset);
+
+    if let Some(addr) = boot::EXECUTABLE_ADDRESS.response() {
+        println!(
+            "[boot] kernel phys/virt = {:#x} / {:#x}",
+            addr.physical_base, addr.virtual_base
+        );
+    }
+
+    let memmap = boot::MEMMAP.response().expect("limine: no memmap response");
+    let entries = memmap.entries();
+    let usable: u64 = entries
+        .iter()
+        .filter(|e| e.type_ == MEMMAP_USABLE)
+        .map(|e| e.length)
+        .sum();
+    println!(
+        "[boot] memmap           = {} entries, {} MiB usable",
+        entries.len(),
+        usable / (1024 * 1024)
+    );
+
+    match boot::RSDP.response() {
+        Some(rsdp) => println!("[boot] rsdp             = {:p}", rsdp.address),
+        None => println!("[boot] rsdp             = (none)"),
+    }
+
+    let cmdline = boot::cmdline();
+    if !cmdline.is_empty() {
+        println!("[boot] cmdline          = {:?}", cmdline);
+    }
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    x86_64::instructions::interrupts::disable();
+    let mut out = unsafe { serial::force_writer() };
+    let _ = writeln!(out, "\nKERNEL PANIC: {info}");
+    qemu::exit(qemu::ExitCode::Failure);
+}

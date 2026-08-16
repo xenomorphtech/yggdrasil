@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "crates/ygg-alloc",
+    "crates/ygg-term",
+    "crates/ygg-bytecode",
+    "crates/ygg-interp",
+    "crates/ygg-rings",
+    "crates/ygg-jit",
+    "tools/xtask",
+    "tools/ygg-asm",
+]
+default-members = ["tools/xtask"]
+
+[workspace.package]
+edition = "2024"

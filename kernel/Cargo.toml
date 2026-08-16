@@ -1,0 +1,20 @@
+[package]
+name = "ygg-kernel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+acpi = "6.1.1"
+limine = "0.6.5"
+log = "0.4.33"
+spin = "0.12.2"
+spinning_top = "0.3.0"
+talc = "5.0.4"
+virtio-drivers = "0.13.0"
+x86_64 = "0.15.5"
+ygg-alloc = { version = "0.1.0", path = "../crates/ygg-alloc" }
+ygg-bytecode = { version = "0.1.0", path = "../crates/ygg-bytecode" }
+ygg-interp = { version = "0.1.0", path = "../crates/ygg-interp" }
+ygg-jit = { version = "0.1.0", path = "../crates/ygg-jit" }
+ygg-rings = { version = "0.1.0", path = "../crates/ygg-rings" }
+ygg-term = { version = "0.1.0", path = "../crates/ygg-term" }

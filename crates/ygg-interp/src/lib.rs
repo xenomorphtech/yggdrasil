@@ -1,0 +1,506 @@
+//! Tier-0 execution engine: the bytecode interpreter.
+//!
+//! Runs on the calling process's native stack (bytecode calls recurse
+//! natively), so the scheduler treats interpreted and future-JIT'd processes
+//! identically. All system effects go through `SystemApi`, which the kernel
+//! implements over real processes and host tests implement as a mock.
+//!
+//! Safepoints: every backward jump and every call polls `api.safepoint()` —
+//! exactly where the JIT will emit its preempt-flag checks.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use ygg_bytecode::{Module, op};
+use ygg_term::{Heap, HeapFull, Term};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trap {
+    /// Type error, bad index, arity mismatch, bad register…
+    Badarg,
+    /// Unknown opcode / truncated code / bad function index.
+    BadCode,
+    /// Heap quota exhausted.
+    HeapFull,
+    /// Process chose to exit with the given global atom as reason.
+    Exit(u32),
+}
+
+impl From<HeapFull> for Trap {
+    fn from(_: HeapFull) -> Trap {
+        Trap::HeapFull
+    }
+}
+
+pub trait SystemApi {
+    fn heap(&mut self) -> &mut Heap;
+    fn self_pid(&self) -> u64;
+    /// `to` must be a pid term. The message is copied by the implementation.
+    fn send(&mut self, to: Term, msg: Term) -> Result<(), Trap>;
+    fn recv(&mut self) -> Term;
+    /// Spawn `fn_idx` of the same module with one immediate argument.
+    fn spawn(&mut self, fn_idx: u32, arg: Term) -> Result<u64, Trap>;
+    fn safepoint(&mut self);
+    /// Map a module-local atom index to a global atom index.
+    fn atom_global(&mut self, local: u32) -> u32;
+    fn print(&mut self, t: Term);
+    /// Open a port of `kind`; returns a port term.
+    fn port_open(&mut self, kind: u8) -> Result<Term, Trap>;
+    /// Submit to a port's SQ. `arg0`/`tag` must be ints; tag -1 skips the CQE.
+    fn port_submit(&mut self, port: Term, op: u8, arg0: Term, tag: Term) -> Result<(), Trap>;
+    /// Fully-qualified call: resolve `module:fname/args.len()` in the *current*
+    /// module table and run it. Atoms are global indices.
+    fn call_ext(&mut self, module_atom: u32, fname_atom: u32, args: &[Term])
+    -> Result<Term, Trap>;
+}
+
+struct Frame<'m> {
+    code: &'m [u8],
+    pc: usize,
+    regs: Vec<Term>,
+}
+
+impl<'m> Frame<'m> {
+    fn u8(&mut self) -> Result<u8, Trap> {
+        let v = *self.code.get(self.pc).ok_or(Trap::BadCode)?;
+        self.pc += 1;
+        Ok(v)
+    }
+    fn u32(&mut self) -> Result<u32, Trap> {
+        let s = self.code.get(self.pc..self.pc + 4).ok_or(Trap::BadCode)?;
+        self.pc += 4;
+        Ok(u32::from_le_bytes(s.try_into().unwrap()))
+    }
+    fn i32(&mut self) -> Result<i32, Trap> {
+        Ok(self.u32()? as i32)
+    }
+    fn i64(&mut self) -> Result<i64, Trap> {
+        let s = self.code.get(self.pc..self.pc + 8).ok_or(Trap::BadCode)?;
+        self.pc += 8;
+        Ok(i64::from_le_bytes(s.try_into().unwrap()))
+    }
+    fn get(&self, r: u8) -> Result<Term, Trap> {
+        self.regs.get(r as usize).copied().ok_or(Trap::Badarg)
+    }
+    fn set(&mut self, r: u8, v: Term) -> Result<(), Trap> {
+        *self.regs.get_mut(r as usize).ok_or(Trap::Badarg)? = v;
+        Ok(())
+    }
+}
+
+/// Execute `fn_idx` with `args`; returns the function's result.
+pub fn run_function(
+    m: &Module,
+    fn_idx: usize,
+    args: &[Term],
+    api: &mut dyn SystemApi,
+) -> Result<Term, Trap> {
+    let f = m.functions.get(fn_idx).ok_or(Trap::BadCode)?;
+    if args.len() != f.arity as usize || (f.nregs as usize) < args.len() {
+        return Err(Trap::Badarg);
+    }
+    let mut fr = Frame { code: &f.code, pc: 0, regs: vec![Term::NIL; f.nregs as usize] };
+    fr.regs[..args.len()].copy_from_slice(args);
+
+    loop {
+        let opcode = fr.u8()?;
+        match opcode {
+            op::NOP => {}
+            op::LOAD_INT => {
+                let rd = fr.u8()?;
+                let v = fr.i64()?;
+                fr.set(rd, Term::int(v))?;
+            }
+            op::LOAD_ATOM => {
+                let rd = fr.u8()?;
+                let local = fr.u32()?;
+                let g = api.atom_global(local);
+                fr.set(rd, Term::atom(g))?;
+            }
+            op::LOAD_NIL => {
+                let rd = fr.u8()?;
+                fr.set(rd, Term::NIL)?;
+            }
+            op::MOVE => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let v = fr.get(rs)?;
+                fr.set(rd, v)?;
+            }
+            op::SELF_PID => {
+                let rd = fr.u8()?;
+                let p = api.self_pid();
+                fr.set(rd, Term::pid(p))?;
+            }
+            op::MAKE_TUPLE => {
+                let rd = fr.u8()?;
+                let n = fr.u8()? as usize;
+                let mut elems = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let r = fr.u8()?;
+                    elems.push(fr.get(r)?);
+                }
+                let t = api.heap().tuple(&elems)?;
+                fr.set(rd, t)?;
+            }
+            op::GET_ELEM => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let idx = fr.u8()? as usize;
+                let t = fr.get(rs)?;
+                let v = unsafe {
+                    if t.kind() != ygg_term::Kind::Tuple || idx >= t.tuple_arity() {
+                        return Err(Trap::Badarg);
+                    }
+                    t.tuple_elem(idx)
+                };
+                fr.set(rd, v)?;
+            }
+            op::CONS => {
+                let rd = fr.u8()?;
+                let rh = fr.u8()?;
+                let rt = fr.u8()?;
+                let (h, t) = (fr.get(rh)?, fr.get(rt)?);
+                let c = api.heap().cons(h, t)?;
+                fr.set(rd, c)?;
+            }
+            op::HEAD | op::TAIL => {
+                let rd = fr.u8()?;
+                let rs = fr.u8()?;
+                let t = fr.get(rs)?;
+                let v = unsafe {
+                    if t.kind() != ygg_term::Kind::Cons {
+                        return Err(Trap::Badarg);
+                    }
+                    if opcode == op::HEAD { t.head() } else { t.tail() }
+                };
+                fr.set(rd, v)?;
+            }
+            op::ADD | op::SUB | op::MUL => {
+                let rd = fr.u8()?;
+                let ra = fr.u8()?;
+                let rb = fr.u8()?;
+                let a = fr.get(ra)?.as_int().ok_or(Trap::Badarg)?;
+                let b = fr.get(rb)?.as_int().ok_or(Trap::Badarg)?;
+                let v = match opcode {
+                    op::ADD => a.checked_add(b),
+                    op::SUB => a.checked_sub(b),
+                    _ => a.checked_mul(b),
+                }
+                .ok_or(Trap::Badarg)?;
+                fr.set(rd, Term::int(v))?;
+            }
+            op::CMP_EQ => {
+                let rd = fr.u8()?;
+                let ra = fr.u8()?;
+                let rb = fr.u8()?;
+                let e = unsafe { ygg_term::eq(fr.get(ra)?, fr.get(rb)?) };
+                fr.set(rd, Term::int(e as i64))?;
+            }
+            op::CMP_LT => {
+                let rd = fr.u8()?;
+                let ra = fr.u8()?;
+                let rb = fr.u8()?;
+                let a = fr.get(ra)?.as_int().ok_or(Trap::Badarg)?;
+                let b = fr.get(rb)?.as_int().ok_or(Trap::Badarg)?;
+                fr.set(rd, Term::int((a < b) as i64))?;
+            }
+            op::JMP => {
+                let off = fr.i32()?;
+                jump(&mut fr, off, api)?;
+            }
+            op::JMP_IF => {
+                let rc = fr.u8()?;
+                let off = fr.i32()?;
+                let taken = fr.get(rc)?.as_int().ok_or(Trap::Badarg)? != 0;
+                if taken {
+                    jump(&mut fr, off, api)?;
+                }
+            }
+            op::CALL => {
+                let rd = fr.u8()?;
+                let callee = fr.u32()? as usize;
+                let n = fr.u8()? as usize;
+                let mut args = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let r = fr.u8()?;
+                    args.push(fr.get(r)?);
+                }
+                api.safepoint();
+                let v = run_function(m, callee, &args, api)?;
+                fr.set(rd, v)?;
+            }
+            op::RET => {
+                let rs = fr.u8()?;
+                return fr.get(rs);
+            }
+            op::SPAWN => {
+                let rd = fr.u8()?;
+                let callee = fr.u32()?;
+                let ra = fr.u8()?;
+                let arg = fr.get(ra)?;
+                if arg.is_boxed() {
+                    // Spawn args are immediates only (pids, ints, atoms) until
+                    // cross-heap spawn-copy lands.
+                    return Err(Trap::Badarg);
+                }
+                let pid = api.spawn(callee, arg)?;
+                fr.set(rd, Term::pid(pid))?;
+            }
+            op::SEND => {
+                let rt = fr.u8()?;
+                let rm = fr.u8()?;
+                let (to, msg) = (fr.get(rt)?, fr.get(rm)?);
+                api.send(to, msg)?;
+            }
+            op::RECV => {
+                let rd = fr.u8()?;
+                let v = api.recv();
+                fr.set(rd, v)?;
+            }
+            op::PRINT => {
+                let rs = fr.u8()?;
+                let v = fr.get(rs)?;
+                api.print(v);
+            }
+            op::EXIT_ATOM => {
+                let rs = fr.u8()?;
+                let a = fr.get(rs)?.as_atom().ok_or(Trap::Badarg)?;
+                return Err(Trap::Exit(a));
+            }
+            op::PORT_OPEN => {
+                let rd = fr.u8()?;
+                let kind = fr.u8()?;
+                let p = api.port_open(kind)?;
+                fr.set(rd, p)?;
+            }
+            op::PORT_SUBMIT => {
+                let rp = fr.u8()?;
+                let o = fr.u8()?;
+                let ra = fr.u8()?;
+                let rt = fr.u8()?;
+                let (port, arg0, tag) = (fr.get(rp)?, fr.get(ra)?, fr.get(rt)?);
+                api.port_submit(port, o, arg0, tag)?;
+            }
+            op::CALL_EXT => {
+                let rd = fr.u8()?;
+                let mlocal = fr.u32()?;
+                let flocal = fr.u32()?;
+                let n = fr.u8()? as usize;
+                let mut args = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let r = fr.u8()?;
+                    args.push(fr.get(r)?);
+                }
+                let mg = api.atom_global(mlocal);
+                let fg = api.atom_global(flocal);
+                api.safepoint();
+                let v = api.call_ext(mg, fg, &args)?;
+                fr.set(rd, v)?;
+            }
+            _ => return Err(Trap::BadCode),
+        }
+    }
+}
+
+fn jump(fr: &mut Frame, off: i32, api: &mut dyn SystemApi) -> Result<(), Trap> {
+    if off < 0 {
+        // Backward jump = loop back-edge = safepoint.
+        api.safepoint();
+    }
+    let pc = fr.pc as i64 + off as i64;
+    if pc < 0 || pc as usize > fr.code.len() {
+        return Err(Trap::BadCode);
+    }
+    fr.pc = pc as usize;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::collections::VecDeque;
+    use alloc::string::String;
+    use ygg_bytecode::{CodeBuilder, Function};
+
+    // `heap` borrows `buf`'s stable allocation; both move together.
+    struct MockApi {
+        #[allow(dead_code)]
+        buf: Vec<u64>,
+        heap: Heap,
+        mailbox: VecDeque<Term>,
+        printed: Vec<String>,
+        spawned: Vec<(u32, Term)>,
+        safepoints: usize,
+    }
+
+    impl MockApi {
+        fn new() -> Box<MockApi> {
+            let mut buf = vec![0u64; 8192];
+            let heap = unsafe { Heap::new(buf.as_mut_ptr().cast(), buf.len() * 8) };
+            Box::new(MockApi {
+                heap,
+                buf,
+                mailbox: VecDeque::new(),
+                printed: Vec::new(),
+                spawned: Vec::new(),
+                safepoints: 0,
+            })
+        }
+    }
+
+    impl SystemApi for MockApi {
+        fn heap(&mut self) -> &mut Heap {
+            &mut self.heap
+        }
+        fn self_pid(&self) -> u64 {
+            7
+        }
+        fn send(&mut self, to: Term, msg: Term) -> Result<(), Trap> {
+            // Loopback: sends to self land in the mock mailbox.
+            assert_eq!(to.as_pid(), Some(7));
+            self.mailbox.push_back(msg);
+            Ok(())
+        }
+        fn recv(&mut self) -> Term {
+            self.mailbox.pop_front().expect("mock recv on empty mailbox")
+        }
+        fn spawn(&mut self, fn_idx: u32, arg: Term) -> Result<u64, Trap> {
+            self.spawned.push((fn_idx, arg));
+            Ok(100 + self.spawned.len() as u64)
+        }
+        fn safepoint(&mut self) {
+            self.safepoints += 1;
+        }
+        fn atom_global(&mut self, local: u32) -> u32 {
+            1000 + local
+        }
+        fn print(&mut self, t: Term) {
+            let mut s = String::new();
+            unsafe { ygg_term::fmt_term(t, &mut s, &|a| if a == 1000 { "ok" } else { "?" }) }
+                .unwrap();
+            self.printed.push(s);
+        }
+        fn port_open(&mut self, kind: u8) -> Result<Term, Trap> {
+            Ok(Term::port(kind as u64 + 50))
+        }
+        fn port_submit(&mut self, port: Term, _op: u8, arg0: Term, tag: Term) -> Result<(), Trap> {
+            port.as_port().ok_or(Trap::Badarg)?;
+            arg0.as_int().ok_or(Trap::Badarg)?;
+            tag.as_int().ok_or(Trap::Badarg)?;
+            Ok(())
+        }
+        fn call_ext(
+            &mut self,
+            _module_atom: u32,
+            _fname_atom: u32,
+            _args: &[Term],
+        ) -> Result<Term, Trap> {
+            Err(Trap::Badarg) // no module table in the mock
+        }
+    }
+
+    /// fact(n) = n <= 1 ? 1 : n * fact(n - 1)
+    fn fact_module() -> Module {
+        let mut b = CodeBuilder::new();
+        // r0 = n. r1 = 2, r2 = (n < 2)
+        b.u8(op::LOAD_INT).u8(1).i64(2);
+        b.u8(op::CMP_LT).u8(2).u8(0).u8(1);
+        b.u8(op::JMP_IF).u8(2).label_ref(0);
+        // r3 = n - 1; r4 = fact(r3); r5 = n * r4; ret r5
+        b.u8(op::LOAD_INT).u8(1).i64(1);
+        b.u8(op::SUB).u8(3).u8(0).u8(1);
+        b.u8(op::CALL).u8(4).u32(0).u8(1).u8(3);
+        b.u8(op::MUL).u8(5).u8(0).u8(4);
+        b.u8(op::RET).u8(5);
+        b.bind(0);
+        b.u8(op::LOAD_INT).u8(5).i64(1);
+        b.u8(op::RET).u8(5);
+        Module {
+            atoms: vec!["fact".into()],
+            functions: vec![Function { name_atom: 0, arity: 1, nregs: 6, code: b.finish().unwrap() }],
+        }
+    }
+
+    #[test]
+    fn factorial() {
+        let m = fact_module();
+        let mut api = MockApi::new();
+        let r = run_function(&m, 0, &[Term::int(10)], &mut *api).unwrap();
+        assert_eq!(r.as_int(), Some(3628800));
+        assert!(api.safepoints >= 9, "calls must hit safepoints");
+    }
+
+    /// Loop 5 times sending self an int, then receive them all into a list.
+    #[test]
+    fn send_recv_loop_with_backedge_safepoints() {
+        let mut b = CodeBuilder::new();
+        // r1 = 0 (i), r2 = 5, r3 = self
+        b.u8(op::LOAD_INT).u8(1).i64(0);
+        b.u8(op::LOAD_INT).u8(2).i64(5);
+        b.u8(op::SELF_PID).u8(3);
+        b.bind(0); // loop head
+        b.u8(op::CMP_LT).u8(4).u8(1).u8(2);
+        b.u8(op::JMP_IF).u8(4).label_ref(1);
+        b.u8(op::JMP).label_ref(2); // exit loop
+        b.bind(1);
+        b.u8(op::SEND).u8(3).u8(1);
+        b.u8(op::LOAD_INT).u8(5).i64(1);
+        b.u8(op::ADD).u8(1).u8(1).u8(5);
+        b.u8(op::JMP).label_ref(0); // back edge -> safepoint
+        b.bind(2);
+        // drain three: r6 = recv; r7 = recv; print both, ret tuple
+        b.u8(op::RECV).u8(6);
+        b.u8(op::RECV).u8(7);
+        b.u8(op::MAKE_TUPLE).u8(8).u8(2).u8(6).u8(7);
+        b.u8(op::PRINT).u8(8);
+        b.u8(op::RET).u8(8);
+        let m = Module {
+            atoms: vec!["main".into()],
+            functions: vec![Function { name_atom: 0, arity: 0, nregs: 9, code: b.finish().unwrap() }],
+        };
+        let mut api = MockApi::new();
+        let r = run_function(&m, 0, &[], &mut *api).unwrap();
+        unsafe {
+            assert_eq!(r.tuple_elem(0).as_int(), Some(0));
+            assert_eq!(r.tuple_elem(1).as_int(), Some(1));
+        }
+        assert_eq!(api.printed, vec!["{0, 1}"]);
+        assert!(api.safepoints >= 5, "back edges must hit safepoints");
+        assert_eq!(api.mailbox.len(), 3, "two of five drained");
+    }
+
+    #[test]
+    fn traps() {
+        // HEAD of a non-list traps Badarg.
+        let mut b = CodeBuilder::new();
+        b.u8(op::LOAD_INT).u8(0).i64(3);
+        b.u8(op::HEAD).u8(1).u8(0);
+        let m = Module {
+            atoms: vec!["t".into()],
+            functions: vec![Function { name_atom: 0, arity: 0, nregs: 2, code: b.finish().unwrap() }],
+        };
+        assert_eq!(run_function(&m, 0, &[], &mut *MockApi::new()), Err(Trap::Badarg));
+
+        // Truncated code traps BadCode.
+        let m2 = Module {
+            atoms: vec!["t".into()],
+            functions: vec![Function { name_atom: 0, arity: 0, nregs: 1, code: vec![op::LOAD_INT, 0] }],
+        };
+        assert_eq!(run_function(&m2, 0, &[], &mut *MockApi::new()), Err(Trap::BadCode));
+
+        // ExitAtom surfaces the global atom.
+        let mut b3 = CodeBuilder::new();
+        b3.u8(op::LOAD_ATOM).u8(0).u32(4);
+        b3.u8(op::EXIT_ATOM).u8(0);
+        let m3 = Module {
+            atoms: vec!["t".into()],
+            functions: vec![Function { name_atom: 0, arity: 0, nregs: 1, code: b3.finish().unwrap() }],
+        };
+        assert_eq!(run_function(&m3, 0, &[], &mut *MockApi::new()), Err(Trap::Exit(1004)));
+    }
+}

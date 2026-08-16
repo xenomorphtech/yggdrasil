@@ -1,0 +1,23 @@
+module counter
+; v2 counter server: new reply format {count2, N} and increments by 10.
+; Loaded over v1 at runtime; running v1 loops migrate here at their next
+; call_ext, keeping their accumulated state.
+
+fn main/1 regs=6 {
+    load_int r1, 0
+    call r2, loop/1, r1
+    load_atom r3, normal
+    exit_atom r3
+}
+
+fn loop/1 regs=10 {
+    recv r1
+    load_atom r2, count2
+    make_tuple r3, r2, r0
+    send r1, r3
+    load_int r4, 10
+    add r5, r0, r4
+    call_ext r6, counter, loop, r5
+    load_atom r7, normal
+    exit_atom r7
+}

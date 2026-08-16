@@ -1,0 +1,23 @@
+module counter
+; v1 counter server. Requests are the requester's pid; replies {count, N}.
+; The loop re-enters itself through call_ext, so a hot-loaded v2 takes over
+; at the next request — with the state (N) carried across.
+
+fn main/1 regs=6 {
+    load_int r1, 0
+    call r2, loop/1, r1
+    load_atom r3, normal
+    exit_atom r3
+}
+
+fn loop/1 regs=10 {
+    recv r1
+    load_atom r2, count
+    make_tuple r3, r2, r0
+    send r1, r3
+    load_int r4, 1
+    add r5, r0, r4
+    call_ext r6, counter, loop, r5
+    load_atom r7, normal
+    exit_atom r7
+}

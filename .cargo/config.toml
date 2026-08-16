@@ -1,0 +1,10 @@
+# Linker script + static relocation for the bare-metal kernel target.
+# Relative -T path: xtask always invokes cargo from the workspace root.
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker.ld",
+    "-C", "relocation-model=static",
+]
+
+[alias]
+xtask = "run -p xtask --"

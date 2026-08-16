@@ -1,0 +1,35 @@
+module mathmod
+; Differential-test workload: recursion, arithmetic, comparisons, list and
+; tuple building, printing. Loaded twice — once per execution engine — and
+; the results must match exactly.
+
+fn main/1 regs=12 {
+    load_int r1, 10
+    call r2, fact/1, r1         ; 3628800
+    load_int r3, 3
+    load_int r4, 4
+    add r5, r3, r4              ; 7
+    load_nil r7
+    cons r6, r2, r7
+    cons r6, r5, r6             ; [7, 3628800]
+    load_atom r8, result
+    make_tuple r9, r8, r2, r6   ; {result, 3628800, [7, 3628800]}
+    print r9
+    send r0, r9
+    load_atom r10, normal
+    exit_atom r10
+}
+
+fn fact/1 regs=8 {
+    load_int r1, 2
+    lt r2, r0, r1
+    jmp_if r2, base
+    load_int r3, 1
+    sub r4, r0, r3
+    call r5, fact/1, r4
+    mul r6, r0, r5
+    ret r6
+base:
+    load_int r7, 1
+    ret r7
+}

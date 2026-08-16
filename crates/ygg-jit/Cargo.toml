@@ -1,0 +1,14 @@
+[package]
+name = "ygg-jit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cranelift-codegen = { version = "0.134", default-features = false, features = ["x86"] }
+cranelift-frontend = { version = "0.134", default-features = false }
+target-lexicon = { version = "0.13.5", default-features = false }
+ygg-bytecode = { path = "../ygg-bytecode" }
+ygg-term = { path = "../ygg-term" }
+
+[dev-dependencies]
+libc = "0.2.189"

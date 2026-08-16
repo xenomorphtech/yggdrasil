@@ -1,0 +1,8 @@
+[package]
+name = "ygg-asm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+ygg-bytecode = { path = "../../crates/ygg-bytecode" }
