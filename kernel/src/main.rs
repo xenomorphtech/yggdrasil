@@ -70,6 +70,11 @@ extern "C" fn kmain() -> ! {
     } else if has_arg("gpudemo") {
         // The Lux driver builds whole-frame binaries; give it a real heap.
         proc::spawn_with_heap(selftest::gpu_visual, 0, 4096);
+    } else if has_arg("terminal") {
+        // The Lux terminal owns both serial input and the virtio-gpu scanout.
+        proc::spawn_with_heap(selftest::terminal_visual, 0, 4096);
+    } else if has_arg("virglprobe") {
+        proc::spawn_with_heap(selftest::virgl_visual, 0, 1024);
     } else if has_arg("verify-disk") {
         proc::spawn(selftest::verify_disk, 0);
     } else {

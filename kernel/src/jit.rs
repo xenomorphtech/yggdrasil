@@ -52,22 +52,35 @@ unsafe extern "C" fn on_stack(arg: u64, f: extern "C" fn(u64) -> u64, new_rsp: u
 struct CompileReq<'a> {
     module: &'a ygg_bytecode::Module,
     atom_map: &'a [u32],
+    resolver: ygg_jit::ExtResolver<'a>,
     out: Option<Result<alloc::vec::Vec<CompiledFn>, ygg_jit::JitError>>,
 }
 
 extern "C" fn do_compile(p: u64) -> u64 {
     let req = unsafe { &mut *(p as *mut CompileReq) };
-    req.out = Some(ygg_jit::compile_module(req.module, req.atom_map));
+    // pcrel_helpers: the code zone sits within ±2 GiB of the kernel image
+    // (vmm::CODE_ZONE_BASE is chosen for exactly this).
+    req.out = Some(ygg_jit::compile_module_linked(
+        req.module,
+        req.atom_map,
+        req.resolver,
+        true,
+    ));
     0
 }
 
 /// Compile and publish a verified module. Returns None (and logs) on any
 /// failure — the caller falls back to the interpreter.
-pub fn compile_and_publish(module: &ygg_bytecode::Module, atom_map: &[u32]) -> Option<JitModule> {
+pub fn compile_and_publish(
+    module: &ygg_bytecode::Module,
+    atom_map: &[u32],
+    resolver: ygg_jit::ExtResolver,
+) -> Option<JitModule> {
     let _guard = COMPILE_LOCK.lock();
     let mut req = CompileReq {
         module,
         atom_map,
+        resolver,
         out: None,
     };
     let top = unsafe {
@@ -114,6 +127,7 @@ fn publish(fns: &[CompiledFn]) -> JitModule {
             let target = match r.target {
                 RelocTarget::Helper(h) => helper_addrs[h as usize],
                 RelocTarget::Function(i) => fn_addrs[i as usize],
+                RelocTarget::Address(a) => a,
             };
             let write_at = unsafe { base_write.add(off + r.offset as usize) };
             let exec_at = base_exec + *off as u64 + r.offset as u64;
@@ -182,6 +196,9 @@ fn helper_table() -> [u64; HELPER_COUNT] {
     t[Helper::SleepMs as usize] = rt_sleep_ms as usize as u64;
     t[Helper::BufNew as usize] = rt_buf_new as usize as u64;
     t[Helper::BufRead as usize] = rt_buf_read as usize as u64;
+    t[Helper::Ticks as usize] = rt_ticks as usize as u64;
+    t[Helper::ResumeTail as usize] = rt_resume_tail as usize as u64;
+    t[Helper::BinAt as usize] = rt_bin_at as usize as u64;
     t
 }
 
@@ -377,6 +394,10 @@ extern "C" fn rt_sleep_ms(ms: u64) {
     let _ = proc::recv_where(|_| false, Some(ms as u64));
 }
 
+extern "C" fn rt_ticks() -> u64 {
+    Term::int(crate::irq::ticks() as i64).0
+}
+
 extern "C" fn rt_call_ext(matom: u64, fatom: u64, ptr: *const Term, n: u64) -> u64 {
     let (Some(ma), Some(fa)) = (Term(matom).as_atom(), Term(fatom).as_atom()) else {
         badarg()
@@ -384,6 +405,22 @@ extern "C" fn rt_call_ext(matom: u64, fatom: u64, ptr: *const Term, n: u64) -> u
     let args = unsafe { core::slice::from_raw_parts(ptr, n as usize) };
     let caller: Option<Arc<LoadedModule>> = modload::current_process_module();
     match modload::call_ext_dynamic(ma, fa, args) {
+        Ok(t) => {
+            if let Some(c) = caller {
+                modload::note_running_pub(proc::current(), &c.name, c.version);
+            }
+            t.0
+        }
+        Err(trap) => modload::exit_for_trap(trap),
+    }
+}
+
+/// A direct-called sealed function returned the tail sentinel: run the
+/// stashed chain (starting in that callee's module) and yield its value to
+/// the direct call site. Mirrors `rt_call_ext`'s RUNNING restore.
+extern "C" fn rt_resume_tail(token: u64) -> u64 {
+    let caller: Option<Arc<LoadedModule>> = modload::current_process_module();
+    match unsafe { modload::resume_tail_from(token) } {
         Ok(t) => {
             if let Some(c) = caller {
                 modload::note_running_pub(proc::current(), &c.name, c.version);
@@ -557,6 +594,21 @@ extern "C" fn rt_list_cat(a: u64, b: u64) -> u64 {
         Ok::<Term, ygg_term::HeapFull>(out)
     })
     .0
+}
+
+extern "C" fn rt_bin_at(bin: u64, idx: u64) -> u64 {
+    let b = Term(bin);
+    let Some(idx) = Term(idx).as_int() else { badarg() };
+    unsafe {
+        if !b.is_boxed() || b.kind() != ygg_term::Kind::Binary || idx < 0 {
+            badarg();
+        }
+        let bytes = b.bin_bytes();
+        if idx as usize >= bytes.len() {
+            badarg();
+        }
+        Term::int(bytes[idx as usize] as i64).0
+    }
 }
 
 extern "C" fn rt_bin_part(bin: u64, off: u64, len: u64) -> u64 {

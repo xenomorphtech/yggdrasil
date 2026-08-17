@@ -44,7 +44,9 @@ Requires: nightly Rust (pinned via `rust-toolchain.toml`), `qemu-system-x86_64`,
 ```sh
 cargo xtask run    # boot in QEMU q35, serial on stdio
 cargo xtask test   # full acceptance suite: two boots + pcap assertion
-cargo xtask watch  # boot the Lux gpu driver on a visible display (GTK)
+cargo xtask watch    # Lux ANSI terminal + TCP REPL (host port 17888)
+cargo xtask termshot # headless dump of that terminal (asserts AA pixels)
+cargo xtask virgl  # virtio-gpu-gl: Lux creates a virgl 3D context
 cargo test         # host tests for all pure crates
 ```
 
@@ -54,9 +56,19 @@ differential), types `PING` at a bytecode echo server over the emulated
 serial line, writes a disk pattern, **reboots** to verify persistence, and
 greps the guest's UDP payload out of a pcap of the virtual NIC.
 
+## Redmagic system library
+
+Yggdrasil's Lux programs live in the sibling [Redmagic](../redmagic) project,
+the system standard library. The xtask build compiles every program in
+`../redmagic/programs/` with the sibling Lux compiler and installs one
+content-addressed pack in the boot image. This includes the device examples,
+TCP/IP stack, ANSI terminal, TCP REPL, disk storage, kernel-backed secure
+random adapter, and the deliberately narrow pure-Lux TLS 1.3 client/server.
+
 ## The Lux TCP/IP stack
 
-Yggdrasil runs a real TCP/IP stack written in [Lux](../lux) (`examples/tcp_ip.lux`),
+Yggdrasil runs a real TCP/IP stack written in [Lux](../lux)
+([`programs/tcp_ip.lux`](../redmagic/programs/tcp_ip.lux)),
 compiled by Lux's Yggdrasil backend into 54 content-addressed, verified bytecode
 modules and JIT-compiled in-kernel. A native adapter owns the NIC (ethernet +
 ARP); every TCP protocol decision — handshake, checksums, ACKs, teardown — is
@@ -101,12 +113,42 @@ timer-wheel sleep for frame pacing. The suite proves it all:
   (`cargo xtask spike` runs the equivalent native fill — useful to isolate
   transport bugs from driver bugs.)
 
-**What this unlocks (virgl):** a 3D/virgl driver is *the same surface*. virgl's
-`CTX_CREATE`, capset queries, resource creation, and `SUBMIT_3D` command
-streams are all just control-queue commands — `OP_CTRL` buffers a Lux program
-can encode today, with backing stores attached via `OP_CTRL_ATTACH`. The two
-known ceilings: QEMU must run with `-device virtio-gpu-gl` (and a GL-capable
-display) for the device to accept 3D contexts, and completions are currently
+## Lux ANSI terminal
+
+`cargo xtask watch` boots Redmagic's `programs/ansi_terminal.lux`, a 40x25 terminal whose
+implementation is entirely Lux above the existing raw device-port surface.
+The shell running QEMU is the serial input stream and the GTK virtio-gpu
+window is the display. The terminal has a reusable Alacritty-style grayscale font (`use font` in
+Lux: Adwaita Mono coverage atlas with integer alpha blending), sixteen VGA
+colors, a visible cursor, wrapping, tabs, backspace, scrolling, and local
+echo. It accepts the common VT100/ANSI sequences:
+
+- cursor movement and position: `CSI A/B/C/D/E/F/G/H/f`
+- erase display/line: `CSI J/K` (modes 0, 1, and 2)
+- SGR reset, bold, reverse, and 16 colors: `CSI m`
+- save/restore cursor: `CSI s/u` and `ESC 7/8`
+
+For example, press `Ctrl-[` to enter ESC, then type `[31mred`; enter another
+ESC with `Ctrl-[` and type `[0m` to reset the color.
+
+The same boot also starts a line-oriented TCP REPL backed by the Lux TCP/IP
+stack and a Lux expression evaluator. Connect from another shell with:
+
+```sh
+nc 127.0.0.1 17888
+```
+
+The REPL evaluates integer expressions with `+`, `-`, `*`, and parentheses.
+It also accepts `help`, `about`, `colors`, and `clear`. It handles input split
+across TCP packets, accepts another client after disconnect, and emits ANSI
+formatting suitable for a normal host terminal.
+
+**What this unlocks (virgl):** a 3D/virgl driver is *the same surface*. The
+reusable `use virgl` library encodes `CTX_CREATE`, capset queries, 3D
+resource creation, `SUBMIT_3D`, and a virgl ccw helper. The kernel negotiates
+the VIRGL feature bit when the device offers it. `cargo xtask watch` runs
+`-device virtio-gpu-gl-pci` so those commands have a real 3D backend; the
+selftest suite stays on 2D `virtio-gpu-pci`. Completions are still
 synchronous/poll-based through the port pump — fence-driven async completion
 is a later upgrade, not an architectural change.
 

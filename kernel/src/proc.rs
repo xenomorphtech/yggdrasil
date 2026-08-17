@@ -149,8 +149,6 @@ pub struct Process {
     stack_slot: u64,
     heap: ProcHeap,
     mailbox: VecDeque<Fragment>,
-    /// Tail-call target stashed by the engines for the invoke trampoline.
-    tail_target: Option<TailTarget>,
     /// Killed while Running on a core: honored at its next safepoint.
     kill_pending: bool,
     /// Bidirectional links (exit-signal propagation).
@@ -302,7 +300,6 @@ fn spawn_inner(
                 stack_slot: slot,
                 heap,
                 mailbox: VecDeque::new(),
-                tail_target: None,
                 kill_pending: false,
                 links,
                 monitors,
@@ -328,9 +325,12 @@ pub fn monitor(target: Pid) -> u64 {
 
 /// Run `f` against the current process's heap (for building terms to send).
 pub fn with_heap<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
-    let pid = current();
-    let mut t = TABLE.lock();
-    f(&mut t.get_mut(&pid).expect("no current process").heap.cur)
+    // Lock-free: the percpu current-heap pointer is set by this core's
+    // scheduler at switch-in and only the owning (running) process touches
+    // the heap — the same contract the interpreter tier already relies on
+    // via `current_heap_ptr`. Every allocation helper lands here, so this
+    // must not take the global TABLE lock.
+    f(unsafe { &mut *current_heap_ptr() })
 }
 
 /// A stashed tail-call target awaiting the engine trampoline.
@@ -343,24 +343,22 @@ pub enum TailTarget {
     Local(u32, Vec<Term>),
 }
 
+// The stash lives in percpu state, not the process table: it is written as
+// an engine function's final act before returning the tail sentinel and read
+// back immediately by the calling trampoline, with no safepoint or blocking
+// point in between — so it can never survive across a context switch. This
+// keeps the hottest path in the system (every tail-recursive iteration) off
+// the global TABLE lock.
 pub fn set_tail_target(module_atom: u32, fname_atom: u32, args: Vec<Term>) {
-    let pid = current();
-    let mut t = TABLE.lock();
-    t.get_mut(&pid).expect("no current process").tail_target =
-        Some(TailTarget::Ext(module_atom, fname_atom, args));
+    *crate::percpu::cpu().tail_target.lock() = Some(TailTarget::Ext(module_atom, fname_atom, args));
 }
 
 pub fn set_tail_target_local(fn_idx: u32, args: Vec<Term>) {
-    let pid = current();
-    let mut t = TABLE.lock();
-    t.get_mut(&pid).expect("no current process").tail_target =
-        Some(TailTarget::Local(fn_idx, args));
+    *crate::percpu::cpu().tail_target.lock() = Some(TailTarget::Local(fn_idx, args));
 }
 
 pub fn take_tail_target() -> Option<TailTarget> {
-    let pid = current();
-    let mut t = TABLE.lock();
-    t.get_mut(&pid).expect("no current process").tail_target.take()
+    crate::percpu::cpu().tail_target.lock().take()
 }
 
 /// Trampoline-point GC: the process has no live frames; `roots` is its entire

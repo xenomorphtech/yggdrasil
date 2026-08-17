@@ -115,6 +115,13 @@ pub mod op {
     /// rd, rbuf, roff, rlen: copy a bounds-checked slice of a blob out as a
     /// fresh binary term.
     pub const BUF_READ: u8 = 53;
+    /// rd: milliseconds since timer start (1 kHz monotonic clock).
+    pub const TICKS: u8 = 54;
+
+    /// rd, rbin, ridx — byte at `ridx` of a binary as an int term.
+    /// Allocation-free byte indexing (`BIN_PART`+`BIN_TO_LIST`+`HEAD` costs
+    /// two heap allocations per byte read); traps badarg out of range.
+    pub const BIN_AT: u8 = 55;
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +147,112 @@ pub enum DecodeError {
 }
 
 const MAGIC: &[u8; 6] = b"YGGM1\n";
+
+/// Skip one instruction's operands (opcode already consumed). Returns the
+/// new offset, or None on a truncated/unknown instruction. Must cover every
+/// opcode in `op` — the verifier rejects anything else before it runs.
+fn skip_operands(opcode: u8, code: &[u8], at: usize) -> Option<usize> {
+    let fixed = |n: usize| at.checked_add(n).filter(|&e| e <= code.len());
+    match opcode {
+        op::NOP => fixed(0),
+        op::LOAD_INT => fixed(9),
+        op::LOAD_ATOM => fixed(5),
+        op::SPAWN => fixed(6),
+        op::LOAD_NIL | op::SELF_PID | op::RECV | op::RET | op::EXIT_ATOM | op::PRINT
+        | op::TICKS | op::SLEEP_MS => fixed(1),
+        op::MOVE | op::HEAD | op::TAIL | op::SEND | op::BNOT | op::BIN_FROM_LIST
+        | op::BIN_TO_LIST | op::BIN_SIZE | op::BUF_TO_BIN | op::BIN_TO_BUF | op::IS_BINARY
+        | op::PORT_OPEN | op::BUF_NEW => fixed(2),
+        op::GET_ELEM | op::CONS | op::ADD | op::SUB | op::MUL | op::CMP_EQ | op::CMP_LT
+        | op::BAND | op::BOR | op::BXOR | op::BSL | op::BSR | op::BIN_CAT | op::LIST_CAT
+        | op::MAP_GET | op::BIN_AT => fixed(3),
+        op::MAP_PUT | op::BIN_PART | op::PORT_SUBMIT | op::BUF_WRITE | op::BUF_READ => fixed(4),
+        op::PORT_SUBMIT2 => fixed(5),
+        op::JMP => fixed(4),
+        op::JMP_IF => fixed(5),
+        op::MAKE_TUPLE => {
+            let n = *code.get(at + 1)? as usize;
+            fixed(2 + n)
+        }
+        op::MAP_NEW => {
+            let n = *code.get(at + 1)? as usize;
+            fixed(2 + 2 * n)
+        }
+        op::BIN_NEW => {
+            let len =
+                u32::from_le_bytes(code.get(at + 1..at + 5)?.try_into().ok()?) as usize;
+            fixed(5 + len)
+        }
+        op::CALL => {
+            let n = *code.get(at + 5)? as usize;
+            fixed(6 + n)
+        }
+        op::TAIL_CALL => {
+            let n = *code.get(at + 4)? as usize;
+            fixed(5 + n)
+        }
+        op::CALL_EXT => {
+            let n = *code.get(at + 9)? as usize;
+            fixed(10 + n)
+        }
+        op::TAIL_CALL_EXT => {
+            let n = *code.get(at + 8)? as usize;
+            fixed(9 + n)
+        }
+        _ => None,
+    }
+}
+
+/// Which functions of this verified module can return the tail sentinel to a
+/// native caller: those containing `TAIL_CALL`/`TAIL_CALL_EXT`, and
+/// transitively those making a sibling `CALL` to such a function (sibling
+/// calls propagate the sentinel by unwinding). Callers that bind an external
+/// call to a function whose bit is false may skip the sentinel check.
+pub fn sentinel_returners(m: &Module) -> Vec<bool> {
+    let mut bits = alloc::vec![false; m.functions.len()];
+    let mut callees: Vec<Vec<u32>> = alloc::vec![Vec::new(); m.functions.len()];
+    for (i, f) in m.functions.iter().enumerate() {
+        let mut at = 0usize;
+        while at < f.code.len() {
+            let opcode = f.code[at];
+            match opcode {
+                op::TAIL_CALL | op::TAIL_CALL_EXT => bits[i] = true,
+                op::CALL => {
+                    // Operands: rd:u8, fn:u32 — the callee index is at +2.
+                    if let Some(t) = f.code.get(at + 2..at + 6) {
+                        callees[i].push(u32::from_le_bytes(t.try_into().unwrap()));
+                    }
+                }
+                _ => {}
+            }
+            match skip_operands(opcode, &f.code, at + 1) {
+                Some(next) => at = next,
+                // Unknown/truncated: be conservative — it may return anything.
+                None => {
+                    bits[i] = true;
+                    break;
+                }
+            }
+        }
+    }
+    // Propagate through sibling calls to a fixpoint.
+    loop {
+        let mut changed = false;
+        for i in 0..bits.len() {
+            if !bits[i]
+                && callees[i]
+                    .iter()
+                    .any(|&c| bits.get(c as usize).copied().unwrap_or(true))
+            {
+                bits[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return bits;
+        }
+    }
+}
 
 impl Module {
     pub fn function_named(&self, name: &str) -> Option<usize> {

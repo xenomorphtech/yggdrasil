@@ -166,7 +166,7 @@ fn verify_fn(m: &Module, fn_idx: usize, f: &Function) -> Result<(), VerifyError>
                     });
                 }
             }
-            op::LOAD_NIL | op::SELF_PID | op::RECV => {
+            op::LOAD_NIL | op::SELF_PID | op::RECV | op::TICKS => {
                 reg_ok(s.u8()?, at)?;
             }
             op::MOVE | op::HEAD | op::TAIL => {
@@ -346,7 +346,7 @@ fn verify_fn(m: &Module, fn_idx: usize, f: &Function) -> Result<(), VerifyError>
                     reg_ok(s.u8()?, at)?;
                 }
             }
-            op::MAP_GET => {
+            op::MAP_GET | op::BIN_AT => {
                 reg_ok(s.u8()?, at)?;
                 reg_ok(s.u8()?, at)?;
                 reg_ok(s.u8()?, at)?;

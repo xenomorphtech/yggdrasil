@@ -25,14 +25,21 @@ pub const KIND_SERIAL: u8 = 0;
 pub const KIND_BLK: u8 = 1;
 pub const KIND_NET: u8 = 2;
 pub const KIND_GPU: u8 = 3;
+/// Cryptographically secure random bytes supplied by virtio-rng.
+pub const KIND_RNG: u8 = 4;
 
-/// Common ops. Serial: WRITE arg0 = byte, READ completes with a byte.
+/// Bound allocations made on behalf of bytecode callers.
+pub const RNG_MAX_REQUEST: usize = 4096;
+
+/// Common ops. Serial: WRITE arg0 = byte, READ completes with a byte,
+/// TRY_READ returns the next byte or -1 immediately (no park).
 /// Blk: WRITE/READ arg0 = sector, arg1 = buffer id (READ allocates its own,
 /// returning the id as result); FLUSH. Net: WRITE arg1 = buffer id (tx frame),
 /// READ parks until a frame arrives, result = buffer id.
 pub const OP_WRITE: u32 = 1;
 pub const OP_READ: u32 = 2;
 pub const OP_FLUSH: u32 = 3;
+pub const OP_TRY_READ: u32 = 4;
 /// Gpu: CTRL arg0 = command buffer id (consumed), arg1 = response capacity
 /// hint; result = response buffer id. CTRL_ATTACH arg0 = command-prefix
 /// buffer id (an ATTACH_BACKING header with nr_entries=1), arg1 = backing
@@ -64,6 +71,7 @@ pub fn open(kind: u8) -> Option<Term> {
         KIND_BLK if crate::virtio::has_blk() => {}
         KIND_NET if crate::virtio::has_net() => {}
         KIND_GPU if crate::virtio::has_gpu() => {}
+        KIND_RNG if crate::virtio::has_rng() => {}
         _ => return None,
     }
     let id = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
@@ -94,6 +102,7 @@ pub fn submit(port_id: u64, sqe: Sqe) -> bool {
         KIND_BLK => blk_drain_sq(p),
         KIND_NET => net_drain_sq(p),
         KIND_GPU => gpu_drain_sq(p),
+        KIND_RNG => rng_drain_sq(p),
         _ => unreachable!(),
     }
     drop(ports);
@@ -117,6 +126,15 @@ fn serial_drain_sq(p: &mut Port) {
             OP_READ => {
                 // Parks until rx bytes arrive; completed by the pump.
                 let _ = p.pending_reads.push(sqe);
+            }
+            OP_TRY_READ => {
+                let result = SERIAL_RX.pop().map(|b| b as i64).unwrap_or(-1);
+                if sqe.tag != SKIP_CQE {
+                    let _ = p.cq.push(Cqe {
+                        tag: sqe.tag,
+                        result,
+                    });
+                }
             }
             _ => {
                 if sqe.tag != SKIP_CQE {
@@ -147,6 +165,29 @@ fn blk_drain_sq(p: &mut Port) {
             },
             OP_FLUSH => 0, // writes already flush
             _ => -1,
+        };
+        if sqe.tag != SKIP_CQE {
+            let _ = p.cq.push(Cqe {
+                tag: sqe.tag,
+                result,
+            });
+        }
+    }
+}
+
+/// virtio-rng: synchronous, bounded, and all-or-error.
+fn rng_drain_sq(p: &mut Port) {
+    while let Some(sqe) = p.sq.pop() {
+        let result = if sqe.op != OP_READ
+            || sqe.arg0 == 0
+            || sqe.arg0 > RNG_MAX_REQUEST as u64
+        {
+            -1
+        } else {
+            match crate::virtio::random_bytes(sqe.arg0 as usize) {
+                Ok(bytes) => buf_create(bytes) as i64,
+                Err(()) => -1,
+            }
         };
         if sqe.tag != SKIP_CQE {
             let _ = p.cq.push(Cqe {

@@ -7,10 +7,13 @@
 //! error — so generated code never sees a failure sentinel.
 //!
 //! ABI: every bytecode function becomes `extern "C" fn(arity × u64) -> u64`.
-//! Sibling calls are colocated (PC-rel); helper calls are absolute
-//! (`movabs`+`call`, Abs8 relocs) since the kernel image is far from the code
-//! zone. Safepoints: a helper call at every call site and loop back-edge —
-//! the same contract the interpreter follows.
+//! Sibling and direct-bound external calls are colocated (PC-rel `call
+//! rel32`). Helper calls are PC-rel too when the publisher places code
+//! within ±2 GiB of the helpers (the kernel's code zone is sited for this);
+//! host loaders keep absolute `movabs`+`call`. Safepoints: a helper call at
+//! dynamic call sites and loop back-edges — direct-bound sites need none,
+//! since the sealed call graph is acyclic (a cycle would require dynamic
+//! dispatch, which keeps its safepoint).
 //!
 //! Known divergence from the interpreter (documented, benign): integer
 //! arithmetic wraps at i61 instead of trapping on overflow.
@@ -81,8 +84,11 @@ pub enum Helper {
     SleepMs = 34,     // (ms term) — parks the process
     BufNew = 35,      // (size term) -> blob id term
     BufRead = 36,     // (buf id term, off term, len term) -> binary
+    Ticks = 37,       // () -> int term (milliseconds)
+    ResumeTail = 38,  // (module token) -> term: run the stashed tail chain
+    BinAt = 39,       // (binary, idx term) -> int term (no allocation)
 }
-pub const HELPER_COUNT: usize = 37;
+pub const HELPER_COUNT: usize = 40;
 
 fn helper_nargs(h: u32) -> usize {
     match h {
@@ -122,6 +128,9 @@ fn helper_nargs(h: u32) -> usize {
         x if x == Helper::SleepMs as u32 => 1,
         x if x == Helper::BufNew as u32 => 1,
         x if x == Helper::BufRead as u32 => 3,
+        x if x == Helper::Ticks as u32 => 0,
+        x if x == Helper::ResumeTail as u32 => 1,
+        x if x == Helper::BinAt as u32 => 2,
         _ => 0,
     }
 }
@@ -149,6 +158,8 @@ pub enum RelocKind {
 pub enum RelocTarget {
     Helper(u32),
     Function(u32),
+    /// A resolved absolute code address (direct-bound external call).
+    Address(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +169,25 @@ pub struct RelocEntry {
     pub target: RelocTarget,
     pub addend: i64,
 }
+
+/// A statically resolvable external call target: an immutable (sealed)
+/// module's already-published function. `addr` is its final executable entry
+/// point; `token` is an opaque runtime handle for the callee module, handed
+/// to `Helper::ResumeTail` when the callee tail-calls out of the direct call.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtTarget {
+    pub addr: u64,
+    pub token: u64,
+    pub arity: u8,
+    /// Whether the callee can return the tail sentinel (it, or a sibling it
+    /// CALLs, ends in a tail call). False lets the call site skip the
+    /// sentinel check entirely — the call is then just `call rel32`.
+    pub may_tail: bool,
+}
+
+/// Resolves `(global module atom, global fname atom)` to a direct-call
+/// target, or None to fall back to the dynamic `Helper::CallExt` path.
+pub type ExtResolver<'a> = &'a dyn Fn(u32, u32) -> Option<ExtTarget>;
 
 pub struct CompiledFn {
     pub code: Vec<u8>,
@@ -198,11 +228,26 @@ fn fn_signature(arity: usize, call_conv: CallConv) -> Signature {
 /// Compile every function of a verified module. `atom_map` maps module-local
 /// atom indices to global ones (baked into the code as constants).
 pub fn compile_module(m: &Module, atom_map: &[u32]) -> Result<Vec<CompiledFn>, JitError> {
+    compile_module_linked(m, atom_map, &|_, _| None, false)
+}
+
+/// Like `compile_module`, but external calls the resolver can pin to a
+/// published sealed function compile to direct calls instead of the dynamic
+/// `Helper::CallExt` dispatch. `pcrel_helpers` emits helper calls as
+/// PC-relative `call rel32` — only valid when the publisher guarantees the
+/// helpers are within ±2 GiB of the code (the kernel's code zone is placed
+/// for exactly this; host loaders must pass false and keep `movabs`).
+pub fn compile_module_linked(
+    m: &Module,
+    atom_map: &[u32],
+    resolver: ExtResolver,
+    pcrel_helpers: bool,
+) -> Result<Vec<CompiledFn>, JitError> {
     let isa = make_isa()?;
     let mut out = Vec::new();
     let mut fb_ctx = FunctionBuilderContext::new();
     for fn_idx in 0..m.functions.len() {
-        out.push(compile_fn(m, atom_map, fn_idx, &isa, &mut fb_ctx)?);
+        out.push(compile_fn(m, atom_map, fn_idx, &isa, &mut fb_ctx, resolver, pcrel_helpers)?);
     }
     Ok(out)
 }
@@ -257,7 +302,8 @@ fn find_leaders(code: &[u8]) -> Result<BTreeSet<usize>, JitError> {
                 d.u8()?;
                 d.u32()?;
             }
-            op::LOAD_NIL | op::SELF_PID | op::RECV | op::RET | op::EXIT_ATOM | op::PRINT => {
+            op::LOAD_NIL | op::SELF_PID | op::RECV | op::RET | op::EXIT_ATOM | op::PRINT
+            | op::TICKS => {
                 d.u8()?;
                 if opcode == op::RET || opcode == op::EXIT_ATOM {
                     leaders.insert(d.pc);
@@ -322,7 +368,7 @@ fn find_leaders(code: &[u8]) -> Result<BTreeSet<usize>, JitError> {
                     d.u8()?;
                 }
             }
-            op::MAP_GET => {
+            op::MAP_GET | op::BIN_AT => {
                 d.u8()?;
                 d.u8()?;
                 d.u8()?;
@@ -432,6 +478,12 @@ struct Tx<'a, 'b> {
     trap_block: ir::Block,
     helpers: BTreeMap<u32, FuncRef>,
     siblings: BTreeMap<u32, FuncRef>,
+    /// Direct-bound external callees: resolved address -> imported func.
+    /// Namespace 2; the index keys `ext_addrs`, which reloc translation
+    /// turns into `RelocTarget::Address`.
+    ext_funcs: BTreeMap<u64, FuncRef>,
+    ext_addrs: Vec<u64>,
+    pcrel_helpers: bool,
 }
 
 impl<'a, 'b> Tx<'a, 'b> {
@@ -458,10 +510,40 @@ impl<'a, 'b> Tx<'a, 'b> {
         let r = self.b.import_function(ExtFuncData {
             name: ExternalName::user(name_ref),
             signature: sig,
-            colocated: false,
+            // PC-rel when the publisher keeps helpers within ±2 GiB (the
+            // kernel code zone); absolute movabs otherwise (host loaders).
+            colocated: self.pcrel_helpers,
             patchable: false,
         });
         self.helpers.insert(idx, r);
+        r
+    }
+
+    /// Import a direct-bound external callee at a known final address as a
+    /// colocated (PC-rel) call target.
+    fn ext_target(&mut self, addr: u64, arity: usize) -> FuncRef {
+        if let Some(&r) = self.ext_funcs.get(&addr) {
+            return r;
+        }
+        let index = self.ext_addrs.len() as u32;
+        self.ext_addrs.push(addr);
+        let name_ref = self
+            .b
+            .func
+            .declare_imported_user_function(UserExternalName {
+                namespace: 2,
+                index,
+            });
+        let sig = fn_signature(arity, self.call_conv);
+        let sig = self.b.import_signature(sig);
+        let r = self.b.import_function(ExtFuncData {
+            name: ExternalName::user(name_ref),
+            signature: sig,
+            // Both ends live in the code zone: rel32 always reaches.
+            colocated: true,
+            patchable: false,
+        });
+        self.ext_funcs.insert(addr, r);
         r
     }
 
@@ -542,6 +624,8 @@ fn compile_fn(
     fn_idx: usize,
     isa: &OwnedTargetIsa,
     fb_ctx: &mut FunctionBuilderContext,
+    resolver: ExtResolver,
+    pcrel_helpers: bool,
 ) -> Result<CompiledFn, JitError> {
     let f = &m.functions[fn_idx];
     let call_conv = isa.default_call_conv();
@@ -550,6 +634,7 @@ fn compile_fn(
     ctx.func.name = UserFuncName::user(1, fn_idx as u32);
 
     let leaders = find_leaders(&f.code)?;
+    let ext_addrs: Vec<u64>;
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, fb_ctx);
         let entry = b.create_block();
@@ -582,6 +667,9 @@ fn compile_fn(
             trap_block,
             helpers: BTreeMap::new(),
             siblings: BTreeMap::new(),
+            ext_funcs: BTreeMap::new(),
+            ext_addrs: Vec::new(),
+            pcrel_helpers,
         };
 
         let mut d = Dec {
@@ -636,6 +724,11 @@ fn compile_fn(
                 op::SELF_PID => {
                     let rd = d.u8()? as usize;
                     let v = tx.call_helper(Helper::SelfPid, &[]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
+                op::TICKS => {
+                    let rd = d.u8()? as usize;
+                    let v = tx.call_helper(Helper::Ticks, &[]).unwrap();
                     tx.b.def_var(tx.regs[rd], v);
                 }
                 op::MAKE_TUPLE => {
@@ -886,13 +979,46 @@ fn compile_fn(
                         let r = d.u8()? as usize;
                         args.push(tx.b.use_var(tx.regs[r]));
                     }
-                    let ma = tx.atom_const(mlocal)?;
-                    let fa = tx.atom_const(flocal)?;
-                    let ptr = tx.spill(&args);
-                    let nv = tx.b.ins().iconst(types::I64, n as i64);
-                    tx.call_helper(Helper::Safepoint, &[]);
-                    let v = tx.call_helper(Helper::CallExt, &[ma, fa, ptr, nv]).unwrap();
-                    tx.b.def_var(tx.regs[rd], v);
+                    let gm = *tx.atom_map.get(mlocal as usize).ok_or(JitError::BadBytecode)?;
+                    let gf = *tx.atom_map.get(flocal as usize).ok_or(JitError::BadBytecode)?;
+                    match resolver(gm, gf) {
+                        Some(t) if t.arity as usize == n && n <= 16 => {
+                            // Sealed callee at a known final address: a plain
+                            // PC-rel call. No safepoint — sealed modules form
+                            // an acyclic call graph, so any unbounded work in
+                            // the callee crosses its own back-edge/tail-call
+                            // safepoints; a cycle would need dynamic dispatch.
+                            let fref = tx.ext_target(t.addr, n);
+                            let call = tx.b.ins().call(fref, &args);
+                            let v = tx.b.inst_results(call)[0];
+                            tx.b.def_var(tx.regs[rd], v);
+                            // Only callees that can actually tail-call out
+                            // need the sentinel check; for the rest the call
+                            // really is just `call rel32`.
+                            if t.may_tail {
+                                let is_sent = tx.b.ins().icmp_imm(IntCC::Equal, v, 7);
+                                let resume = tx.b.create_block();
+                                let join = tx.b.create_block();
+                                tx.b.ins().brif(is_sent, resume, &[], join, &[]);
+                                tx.b.switch_to_block(resume);
+                                let tok = tx.b.ins().iconst(types::I64, t.token as i64);
+                                let v2 = tx.call_helper(Helper::ResumeTail, &[tok]).unwrap();
+                                tx.b.def_var(tx.regs[rd], v2);
+                                tx.b.ins().jump(join, &[]);
+                                tx.b.switch_to_block(join);
+                            }
+                        }
+                        _ => {
+                            let ma = tx.atom_const(mlocal)?;
+                            let fa = tx.atom_const(flocal)?;
+                            let ptr = tx.spill(&args);
+                            let nv = tx.b.ins().iconst(types::I64, n as i64);
+                            tx.call_helper(Helper::Safepoint, &[]);
+                            let v =
+                                tx.call_helper(Helper::CallExt, &[ma, fa, ptr, nv]).unwrap();
+                            tx.b.def_var(tx.regs[rd], v);
+                        }
+                    }
                 }
                 op::TAIL_CALL_EXT => {
                     let mlocal = d.u32()?;
@@ -1044,6 +1170,15 @@ fn compile_fn(
                     let v = tx.call_helper(h, &[a]).unwrap();
                     tx.b.def_var(tx.regs[rd], v);
                 }
+                op::BIN_AT => {
+                    let rd = d.u8()? as usize;
+                    let rb = d.u8()? as usize;
+                    let ri = d.u8()? as usize;
+                    let b_ = tx.b.use_var(tx.regs[rb]);
+                    let i = tx.b.use_var(tx.regs[ri]);
+                    let v = tx.call_helper(Helper::BinAt, &[b_, i]).unwrap();
+                    tx.b.def_var(tx.regs[rd], v);
+                }
                 op::BIN_PART => {
                     let rd = d.u8()? as usize;
                     let rb = d.u8()? as usize;
@@ -1083,6 +1218,7 @@ fn compile_fn(
         tx.b.ins().trap(TrapCode::user(1).unwrap());
 
         tx.b.seal_all_blocks();
+        ext_addrs = core::mem::take(&mut tx.ext_addrs);
         tx.b.finalize(isa.frontend_config());
     }
 
@@ -1112,6 +1248,11 @@ fn compile_fn(
                 match uen.namespace {
                     0 => RelocTarget::Helper(uen.index),
                     1 => RelocTarget::Function(uen.index),
+                    2 => RelocTarget::Address(
+                        *ext_addrs
+                            .get(uen.index as usize)
+                            .ok_or(JitError::UnsupportedReloc)?,
+                    ),
                     _ => return Err(JitError::UnsupportedReloc),
                 }
             }
@@ -1139,7 +1280,8 @@ fn skip_insn(d: &mut Dec) -> Result<(), JitError> {
             d.u8()?;
             d.u32()?;
         }
-        op::LOAD_NIL | op::SELF_PID | op::RECV | op::RET | op::EXIT_ATOM | op::PRINT => {
+        op::LOAD_NIL | op::SELF_PID | op::RECV | op::RET | op::EXIT_ATOM | op::PRINT
+        | op::TICKS => {
             d.u8()?;
         }
         op::MOVE | op::HEAD | op::TAIL | op::SEND => {
@@ -1197,7 +1339,7 @@ fn skip_insn(d: &mut Dec) -> Result<(), JitError> {
                 d.u8()?;
             }
         }
-        op::MAP_GET => {
+        op::MAP_GET | op::BIN_AT => {
             d.u8()?;
             d.u8()?;
             d.u8()?;
@@ -1328,6 +1470,7 @@ mod tests {
                     let target = match r.target {
                         RelocTarget::Helper(h) => helpers[h as usize],
                         RelocTarget::Function(i) => fn_addrs[i as usize],
+                        RelocTarget::Address(a) => a,
                     };
                     let at = base.add(off + r.offset as usize);
                     match r.kind {

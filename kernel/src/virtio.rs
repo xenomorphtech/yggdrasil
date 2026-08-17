@@ -11,6 +11,7 @@ use spin::Mutex;
 use virtio_drivers::device::blk::{SECTOR_SIZE, VirtIOBlk};
 use virtio_drivers::device::common::Feature;
 use virtio_drivers::device::net::VirtIONet;
+use virtio_drivers::device::rng::VirtIORng;
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::{DeviceType, Transport};
 use virtio_drivers::transport::pci::bus::{Cam, Command, MmioCam, PciRoot};
@@ -24,9 +25,11 @@ const NET_BUF_LEN: usize = 2048;
 
 type Blk = VirtIOBlk<KernelHal, PciTransport>;
 type Net = VirtIONet<KernelHal, PciTransport, NET_QUEUE_SIZE>;
+type Rng = VirtIORng<KernelHal, PciTransport>;
 
 static BLK: Mutex<Option<Blk>> = Mutex::new(None);
 static NET: Mutex<Option<Net>> = Mutex::new(None);
+static RNG: Mutex<Option<Rng>> = Mutex::new(None);
 
 /// virtio-gpu as a raw *transport*: the kernel owns the control virtqueue but
 /// never interprets the commands flowing through it — the GPU protocol
@@ -97,10 +100,21 @@ pub fn init() {
                 log::info!("virtio: net at {df}, mac {:02x?}", net.mac_address());
                 *NET.lock() = Some(net);
             }
+            DeviceType::EntropySource => {
+                let t =
+                    PciTransport::new::<KernelHal, _>(&mut root, df).expect("virtio-rng transport");
+                let rng = VirtIORng::new(t).expect("virtio-rng init");
+                log::info!("virtio: entropy source at {df}");
+                *RNG.lock() = Some(rng);
+            }
             DeviceType::GPU => {
                 let mut t =
                     PciTransport::new::<KernelHal, _>(&mut root, df).expect("virtio-gpu transport");
-                let features = t.begin_init(Feature::VERSION_1);
+                // VERSION_1 plus VIRGL (bit 0) when the device offers it.
+                // 2D commands still work; 3D/virgl contexts need virtio-gpu-gl.
+                const VIRTIO_GPU_F_VIRGL: u64 = 1 << 0;
+                let wanted = Feature::from_bits_retain(Feature::VERSION_1.bits() | VIRTIO_GPU_F_VIRGL);
+                let features = t.begin_init(wanted);
                 let ctrl = VirtQueue::<KernelHal, 64>::new(&mut t, 0, false, false)
                     .expect("virtio-gpu ctrl queue");
                 // Cursor queue (1) intentionally left unpopulated.
@@ -121,8 +135,32 @@ pub fn has_net() -> bool {
     NET.lock().is_some()
 }
 
+pub fn has_rng() -> bool {
+    RNG.lock().is_some()
+}
+
 pub fn has_gpu() -> bool {
     GPU.lock().is_some()
+}
+
+/// Fill a fresh buffer exclusively from the virtio entropy device.
+///
+/// The device is allowed to complete a request partially, so keep requesting
+/// until every byte has been initialized. A zero-byte completion is treated
+/// as failure rather than returning predictable or partially initialized data.
+pub fn random_bytes(length: usize) -> Result<alloc::vec::Vec<u8>, ()> {
+    let mut bytes = alloc::vec![0u8; length];
+    let mut filled = 0usize;
+    let mut guard = RNG.lock();
+    let rng = guard.as_mut().ok_or(())?;
+    while filled < length {
+        let received = rng.request_entropy(&mut bytes[filled..]).map_err(|_| ())?;
+        if received == 0 || received > length - filled {
+            return Err(());
+        }
+        filled += received;
+    }
+    Ok(bytes)
 }
 
 /// Submit one opaque command to the gpu control queue and wait for the

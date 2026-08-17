@@ -13,6 +13,13 @@ use ygg_bytecode::Module;
 use ygg_interp::{SystemApi, Trap};
 use ygg_term::{Heap, Term};
 
+fn host_ticks_ms() -> i64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as i64
+}
+
 #[derive(Default)]
 struct Atoms {
     names: Vec<String>,
@@ -105,6 +112,9 @@ impl SystemApi for HostApi {
     }
     fn sleep_ms(&mut self, ms: u64) {
         std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    fn ticks(&self) -> Term {
+        Term::int(host_ticks_ms())
     }
     fn call_ext(&mut self, module_atom: u32, fname_atom: u32, args: &[Term]) -> Result<Term, Trap> {
         let (mname, fname, target, depth) = {
@@ -452,6 +462,8 @@ mod jit_host {
                     let target = match r.target {
                         RelocTarget::Helper(h) => helpers[h as usize],
                         RelocTarget::Function(i) => fn_addrs[i as usize],
+                        // Host mode never passes a resolver, so no bound sites.
+                        RelocTarget::Address(a) => a,
                     };
                     let at = base.add(off + r.offset as usize);
                     match r.kind {
@@ -616,6 +628,27 @@ mod jit_host {
     extern "C" fn h_sleep_ms(ms: u64) {
         if let Some(ms) = Term(ms).as_int() {
             std::thread::sleep(std::time::Duration::from_millis(ms.max(0) as u64));
+        }
+    }
+    extern "C" fn h_ticks() -> u64 {
+        Term::int(super::host_ticks_ms()).0
+    }
+    extern "C" fn h_resume_tail(_token: u64) -> u64 {
+        // The host never passes a resolver, so no direct-bound sites exist.
+        die("resume_tail on host")
+    }
+    extern "C" fn h_bin_at(bin: u64, idx: u64) -> u64 {
+        let b = Term(bin);
+        let Some(idx) = Term(idx).as_int() else { die("bin_at: bad index") };
+        unsafe {
+            if !b.is_boxed() || b.kind() != ygg_term::Kind::Binary || idx < 0 {
+                die("bin_at badarg");
+            }
+            let bytes = b.bin_bytes();
+            if idx as usize >= bytes.len() {
+                die("bin_at out of range");
+            }
+            Term::int(bytes[idx as usize] as i64).0
         }
     }
     extern "C" fn h_call_ext(ma: u64, fa: u64, ptr: *const Term, n: u64) -> u64 {
@@ -828,6 +861,9 @@ mod jit_host {
         t[Helper::SleepMs as usize] = h_sleep_ms as usize as u64;
         t[Helper::BufNew as usize] = h_buf_new as usize as u64;
         t[Helper::BufRead as usize] = h_buf_read as usize as u64;
+        t[Helper::Ticks as usize] = h_ticks as usize as u64;
+        t[Helper::ResumeTail as usize] = h_resume_tail as usize as u64;
+        t[Helper::BinAt as usize] = h_bin_at as usize as u64;
         t
     }
 }

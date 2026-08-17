@@ -88,6 +88,10 @@ pub trait SystemApi {
     }
     /// Park the process for `ms` without consuming a mailbox message.
     fn sleep_ms(&mut self, _ms: u64) {}
+    /// Milliseconds since timer start (1 kHz). Host stubs may return 0.
+    fn ticks(&self) -> Term {
+        Term::int(0)
+    }
     /// All-register submit (`PORT_SUBMIT2`): dynamic op/tag plus `arg1`.
     fn port_submit2(
         &mut self,
@@ -204,6 +208,10 @@ pub fn run_function(
                 let rd = fr.u8()?;
                 let p = api.self_pid();
                 fr.set(rd, Term::pid(p))?;
+            }
+            op::TICKS => {
+                let rd = fr.u8()?;
+                fr.set(rd, api.ticks())?;
             }
             op::MAKE_TUPLE => {
                 let rd = fr.u8()?;
@@ -599,6 +607,24 @@ pub fn run_function(
                     Ok(out)
                 })?;
                 fr.set(rd, out)?;
+            }
+            op::BIN_AT => {
+                let rd = fr.u8()?;
+                let rb = fr.u8()?;
+                let ri = fr.u8()?;
+                let b = fr.get(rb)?;
+                let idx = fr.get(ri)?.as_int().ok_or(Trap::Badarg)?;
+                let byte = unsafe {
+                    if !b.is_boxed() || b.kind() != ygg_term::Kind::Binary || idx < 0 {
+                        return Err(Trap::Badarg);
+                    }
+                    let bytes = b.bin_bytes();
+                    if idx as usize >= bytes.len() {
+                        return Err(Trap::Badarg);
+                    }
+                    bytes[idx as usize]
+                };
+                fr.set(rd, Term::int(byte as i64))?;
             }
             op::BIN_PART => {
                 let rd = fr.u8()?;

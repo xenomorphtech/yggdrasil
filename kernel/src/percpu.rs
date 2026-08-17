@@ -43,6 +43,13 @@ pub struct Cpu {
     pub post_switch: AtomicU64,
     /// Debug: which scheduler-loop step this core last entered.
     pub phase: AtomicU64,
+    /// The running process's pending tail-call target. Core-local by
+    /// construction: it is stashed as an engine function's final act before
+    /// returning the tail sentinel and consumed immediately by the trampoline
+    /// that made the call — no safepoint or blocking point lies between, so
+    /// the window can never span a context switch. The Mutex is uncontended
+    /// (same-core access only) and exists for interior mutability.
+    pub tail_target: Mutex<Option<crate::proc::TailTarget>>,
 }
 
 unsafe impl Sync for Cpu {}
@@ -69,6 +76,7 @@ pub fn init(count: usize, bsp_lapic_id: u32) {
                     idle: AtomicBool::new(false),
                     post_switch: AtomicU64::new(0),
                     phase: AtomicU64::new(0),
+                    tail_target: Mutex::new(None),
                 }));
                 cpu.self_ptr = cpu as *const Cpu;
                 &*cpu

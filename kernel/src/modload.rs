@@ -24,6 +24,14 @@ pub struct LoadedModule {
     pub atom_map: Vec<u32>,
     /// Tier-1 native code (None -> interpreter tier-0).
     pub jit: Option<crate::jit::JitModule>,
+    /// Content-addressed and immortal: the name names the bytes, the slot is
+    /// never replaced or purged, and external calls to it may be bound to its
+    /// published code address at the callers' compile time.
+    pub sealed: bool,
+    /// Per function: can it return the tail sentinel to a native caller?
+    /// Callers direct-binding to a function whose bit is false skip the
+    /// sentinel check at the call site.
+    pub tailers: Vec<bool>,
 }
 
 /// BEAM's two-version model: `current` serves new external calls; `old` keeps
@@ -46,7 +54,7 @@ pub enum LoadError {
 }
 
 pub fn load(name: &str, bytes: &[u8]) -> Result<Arc<LoadedModule>, LoadError> {
-    load_with_engine(name, bytes, true)
+    load_full(name, bytes, true, false)
 }
 
 pub fn load_with_engine(
@@ -54,12 +62,37 @@ pub fn load_with_engine(
     bytes: &[u8],
     use_jit: bool,
 ) -> Result<Arc<LoadedModule>, LoadError> {
+    load_full(name, bytes, use_jit, false)
+}
+
+/// Load a content-addressed (immutable) module. Idempotent: a name that is
+/// already sealed returns the existing instance untouched.
+pub fn load_sealed(
+    name: &str,
+    bytes: &[u8],
+    use_jit: bool,
+) -> Result<Arc<LoadedModule>, LoadError> {
+    if let Some(slot) = MODULES.lock().get(name)
+        && slot.current.sealed
+    {
+        return Ok(slot.current.clone());
+    }
+    load_full(name, bytes, use_jit, true)
+}
+
+fn load_full(
+    name: &str,
+    bytes: &[u8],
+    use_jit: bool,
+    sealed: bool,
+) -> Result<Arc<LoadedModule>, LoadError> {
     let module = Module::decode(bytes).map_err(LoadError::Decode)?;
     // The verifier is the isolation boundary: nothing unverified ever runs.
     ygg_bytecode::verify::verify(&module).map_err(LoadError::Verify)?;
     let atom_map: Vec<u32> = module.atoms.iter().map(|a| atoms::intern(a)).collect();
+    let tailers = ygg_bytecode::sentinel_returners(&module);
     let jit = if use_jit {
-        crate::jit::compile_and_publish(&module, &atom_map)
+        crate::jit::compile_and_publish(&module, &atom_map, &resolve_ext_direct)
     } else {
         None
     };
@@ -72,8 +105,15 @@ pub fn load_with_engine(
         module,
         atom_map,
         jit,
+        sealed,
+        tailers,
     });
     match mods.get_mut(name) {
+        // Sealed names are immutable and direct-bound callers hold the
+        // published code address: never swap the instance out.
+        Some(slot) if slot.current.sealed => {
+            return Ok(slot.current.clone());
+        }
         Some(slot) => {
             slot.old = Some(core::mem::replace(&mut slot.current, loaded.clone()));
         }
@@ -100,6 +140,51 @@ pub fn load_with_engine(
 
 pub fn current(name: &str) -> Option<Arc<LoadedModule>> {
     MODULES.lock().get(name).map(|s| s.current.clone())
+}
+
+/// Direct-bind hits/misses across all compiles (misses = sites left dynamic).
+static EXT_BIND_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static EXT_BIND_MISSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn ext_bind_stats() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        EXT_BIND_HITS.load(Ordering::Relaxed),
+        EXT_BIND_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+/// Compile-time resolver for `CALL_EXT` sites: a callee that is sealed,
+/// JIT'd, and of direct-call arity gets its published entry address baked
+/// into the caller. The token is the callee's stable `LoadedModule` address
+/// (immortal for sealed modules) for `ResumeTail` dispatch.
+fn resolve_ext_direct(module_atom: u32, fname_atom: u32) -> Option<ygg_jit::ExtTarget> {
+    use core::sync::atomic::Ordering;
+    let resolved = (|| {
+        let mods = MODULES.lock();
+        let slot = mods.get(atoms::name(module_atom))?;
+        let m = &slot.current;
+        if !m.sealed {
+            return None;
+        }
+        let jit = m.jit.as_ref()?;
+        let idx = m.module.function_named(atoms::name(fname_atom))?;
+        let f = &m.module.functions[idx];
+        if f.arity > 16 {
+            return None;
+        }
+        Some(ygg_jit::ExtTarget {
+            addr: jit.fn_addrs[idx],
+            token: Arc::as_ptr(m) as u64,
+            arity: f.arity,
+            may_tail: m.tailers.get(idx).copied().unwrap_or(true),
+        })
+    })();
+    match &resolved {
+        Some(_) => EXT_BIND_HITS.fetch_add(1, Ordering::Relaxed),
+        None => EXT_BIND_MISSES.fetch_add(1, Ordering::Relaxed),
+    };
+    resolved
 }
 
 fn note_running(pid: proc::Pid, name: &str, version: u64) {
@@ -156,29 +241,64 @@ fn invoke_inner(
             debug_assert!(r.0 & 7 != 7, "reserved word escaped as a term");
             return Ok(r);
         }
-        match proc::take_tail_target().ok_or(Trap::BadCode)? {
-            proc::TailTarget::Ext(ma, fa, targs) => {
-                let mname = atoms::name(ma);
-                let target = current(mname).ok_or(Trap::Badarg)?;
-                let fname = atoms::name(fa);
-                let idx = target.module.function_named(fname).ok_or(Trap::Badarg)?;
-                if target.module.functions[idx].arity as usize != targs.len() {
-                    return Err(Trap::Badarg);
-                }
-                note_running(proc::current(), &target.name, target.version);
-                args = targs;
-                module = target;
-                fn_idx = idx;
-            }
-            proc::TailTarget::Local(idx, targs) => {
-                // Same module instance; the verifier already bounds-checked
-                // the index and matched the arity.
-                args = targs;
-                fn_idx = idx as usize;
-            }
-        }
+        next_tail_target(&mut module, &mut fn_idx, &mut args)?;
         if gc {
             proc::maybe_compact(&mut args);
+        }
+    }
+}
+
+/// Consume the stashed tail target into (module, fn_idx, args).
+fn next_tail_target(
+    module: &mut Arc<LoadedModule>,
+    fn_idx: &mut usize,
+    args: &mut alloc::vec::Vec<Term>,
+) -> Result<(), Trap> {
+    match proc::take_tail_target().ok_or(Trap::BadCode)? {
+        proc::TailTarget::Ext(ma, fa, targs) => {
+            let mname = atoms::name(ma);
+            let target = current(mname).ok_or(Trap::Badarg)?;
+            let fname = atoms::name(fa);
+            let idx = target.module.function_named(fname).ok_or(Trap::Badarg)?;
+            if target.module.functions[idx].arity as usize != targs.len() {
+                return Err(Trap::Badarg);
+            }
+            note_running(proc::current(), &target.name, target.version);
+            *args = targs;
+            *module = target;
+            *fn_idx = idx;
+        }
+        proc::TailTarget::Local(idx, targs) => {
+            // Same module instance; the verifier already bounds-checked
+            // the index and matched the arity.
+            *args = targs;
+            *fn_idx = idx as usize;
+        }
+    }
+    Ok(())
+}
+
+/// Run the tail chain a direct-called sealed function left stashed, starting
+/// in that callee's module (identified by its stable `LoadedModule` address).
+/// Nested context: never compacts — the direct caller's frames hold live
+/// terms, exactly like the dynamic `call_ext` path.
+///
+/// Safety: `token` must be a pointer previously produced by
+/// `resolve_ext_direct` for a sealed module; sealed instances are immortal.
+pub unsafe fn resume_tail_from(token: u64) -> Result<Term, Trap> {
+    let ptr = token as *const LoadedModule;
+    let mut module = unsafe {
+        Arc::increment_strong_count(ptr);
+        Arc::from_raw(ptr)
+    };
+    let mut fn_idx = 0usize;
+    let mut args: alloc::vec::Vec<Term> = alloc::vec::Vec::new();
+    loop {
+        next_tail_target(&mut module, &mut fn_idx, &mut args)?;
+        let r = invoke_once(&module, fn_idx, &args)?;
+        if r != ygg_interp::TAIL_SENTINEL {
+            debug_assert!(r.0 & 7 != 7, "reserved word escaped as a term");
+            return Ok(r);
         }
     }
 }
@@ -426,6 +546,10 @@ impl SystemApi for KernelApi {
         // A never-matching receive: parks on the timer wheel, consumes no
         // mailbox message.
         let _ = proc::recv_where(|_| false, Some(ms));
+    }
+
+    fn ticks(&self) -> Term {
+        Term::int(crate::irq::ticks() as i64)
     }
 
     fn buf_new(&mut self, size: Term) -> Result<Term, Trap> {

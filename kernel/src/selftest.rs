@@ -39,15 +39,19 @@ pub extern "C" fn proc_tests(_arg: u64) {
     receive_after();
     selective_receive();
     blk_port();
+    rng_port();
     net_port();
     verifier_rejects();
     runtime_module_load();
     hot_code_loading();
     differential_engines();
     lux_tcp_stack();
+    lux_redmagic();
     lux_bounded_loop();
     lux_port_hello();
     lux_gpu_demo();
+    lux_font_scene();
+    lux_virgl_probe();
     lux_tcp_echo_live();
     bytecode();
     serial_port_echo();
@@ -372,6 +376,22 @@ fn bytecode() {
 
 /// Submit one SQE on `port` and block for its `{port_reply, _, tag, result}`.
 fn port_request(port: Term, op: u32, arg0: u64, arg1: u64, tag: i64) -> i64 {
+    port_request_timeout(port, op, arg0, arg1, tag, Some(10_000))
+        .expect("port completion timed out")
+}
+
+fn port_request_wait(port: Term, op: u32, arg0: u64, arg1: u64, tag: i64) -> i64 {
+    port_request_timeout(port, op, arg0, arg1, tag, None).expect("blocking port request ended")
+}
+
+fn port_request_timeout(
+    port: Term,
+    op: u32,
+    arg0: u64,
+    arg1: u64,
+    tag: i64,
+    timeout_ms: Option<u64>,
+) -> Option<i64> {
     use ygg_rings::Sqe;
     let id = port.as_port().unwrap();
     assert!(
@@ -395,10 +415,9 @@ fn port_request(port: Term, op: u32, arg0: u64, arg1: u64, tag: i64) -> i64 {
                 && m.tuple_elem(0) == reply
                 && m.tuple_elem(2) == Term::int(tag)
         },
-        Some(10_000),
-    )
-    .expect("port completion timed out");
-    unsafe { msg.tuple_elem(3).as_int().unwrap() }
+        timeout_ms,
+    )?;
+    Some(unsafe { msg.tuple_elem(3).as_int().unwrap() })
 }
 
 fn blk_pattern() -> Vec<u8> {
@@ -425,6 +444,32 @@ fn blk_port() {
     let back = crate::ports::buf_take(r as u64).unwrap();
     assert_eq!(back, data, "sector read-back mismatch");
     println!("[ok] blk port: wrote and read back sector {BLK_TEST_SECTOR} via rings");
+}
+
+fn rng_port() {
+    use crate::ports::OP_READ;
+    let port = crate::ports::open(crate::ports::KIND_RNG).expect("no virtio-rng device");
+    let first = port_request(port, OP_READ, 64, 0, 12);
+    let second = port_request(port, OP_READ, 64, 0, 13);
+    assert!(first > 0 && second > 0, "rng request failed");
+    let first = crate::ports::buf_take(first as u64).unwrap();
+    let second = crate::ports::buf_take(second as u64).unwrap();
+    assert_eq!(first.len(), 64, "rng returned a short buffer");
+    assert_eq!(second.len(), 64, "rng returned a short buffer");
+    assert!(first.iter().any(|byte| *byte != 0), "rng returned all zeroes");
+    assert_ne!(first, second, "rng repeated a 512-bit output");
+    assert_eq!(
+        port_request(
+            port,
+            OP_READ,
+            crate::ports::RNG_MAX_REQUEST as u64 + 1,
+            0,
+            14,
+        ),
+        -1,
+        "rng accepted an oversized request"
+    );
+    println!("[ok] rng port: two distinct 512-bit CSPRNG reads");
 }
 
 /// Second-boot phase (cmdline `verify-disk`): the pattern written by the
@@ -709,6 +754,48 @@ fn lux_tcp_stack() {
     println!("[ok] lux tcp/ip stack: full protocol suite passed on yggdrasil");
 }
 
+fn lux_redmagic() {
+    let me = proc::current();
+    // TLS exercises the full pure-Lux SHA-256/HMAC/HKDF and AEAD stack. Keep its
+    // allocation churn out of the coordinator process and give it room to grow.
+    proc::spawn_with_heap(lux_redmagic_runner, Term::pid(me).0, 32768);
+    let msg = proc::recv_timeout(180_000).expect("Redmagic self-test never reported");
+    assert_eq!(
+        msg,
+        atoms::atom("redmagic_ok"),
+        "Redmagic self-test failed"
+    );
+    println!("[ok] Redmagic: disk, CSPRNG, and pure-Lux TLS client/server passed");
+}
+
+extern "C" fn lux_redmagic_runner(parent_raw: u64) {
+    let parent = Term(parent_raw).as_pid().unwrap();
+    let (key, value) = proc::alloc_retry(|heap| {
+        Ok((
+            heap.binary(b"redmagic-selftest")?,
+            heap.binary(b"persistent Lux data")?,
+        ))
+    });
+    assert_eq!(
+        lux_call_gc("storage_roundtrip", &[Term::int(64), key, value]),
+        atoms::atom("true"),
+        "Redmagic disk storage roundtrip failed"
+    );
+
+    let random = lux_call_gc("secure_random_bytes", &[Term::int(64)]);
+    unsafe {
+        assert!(random.is_boxed() && random.kind() == ygg_term::Kind::Binary);
+        assert_eq!(random.bin_bytes().len(), 64, "Redmagic CSPRNG length mismatch");
+    }
+
+    assert_eq!(
+        lux_call_gc("tls_profile_smoke", &[]),
+        atoms::atom("true"),
+        "Redmagic TLS 1.3 profile self-test failed"
+    );
+    proc::send(parent, atoms::atom("redmagic_ok"));
+}
+
 extern "C" fn lux_tcp_runner(parent_raw: u64) {
     let parent = Term(parent_raw).as_pid().unwrap();
     let pack = crate::modload::boot_module_bytes("tcp_ip.luxpack").expect("no luxpack");
@@ -769,8 +856,11 @@ fn load_luxpack(bytes: &[u8]) -> Option<alloc::string::String> {
         let name = strat(&mut at)?;
         let dlen = u32at(&mut at)?;
         let data = take(&mut at, dlen)?;
-        crate::modload::load_with_engine(&name, data, LUX_USE_JIT).ok()?;
+        // Content-addressed: sealed, so callers direct-bind to its code.
+        crate::modload::load_sealed(&name, data, LUX_USE_JIT).ok()?;
     }
+    let (hits, misses) = crate::modload::ext_bind_stats();
+    crate::println!("[lux] direct-bound ext call sites: {hits} bound, {misses} dynamic");
     let alias_count = u32at(&mut at)?;
     let mut aliases = LUX_ALIASES.lock();
     for _ in 0..alias_count {
@@ -831,6 +921,60 @@ fn lux_gpu_demo() {
     let msg = proc::recv_timeout(120_000).expect("lux gpu animation never finished");
     assert_eq!(msg, atoms::atom("lux_gpu_anim_ok"));
     println!("[ok] lux gpu: animation played via buf_write");
+    // The harness screendumps the final animation frame on that marker; hold
+    // the scanout so the font scene doesn't replace it mid-dump.
+    let _ = proc::recv_timeout(1_000);
+}
+
+fn lux_font_scene() {
+    let me = proc::current();
+    proc::spawn_with_heap(lux_font_runner, Term::pid(me).0, 4096);
+    let msg = proc::recv_timeout(120_000).expect("lux font scene never finished");
+    assert_eq!(msg, atoms::atom("lux_font_ok"));
+    println!("[ok] lux font: grayscale atlas rendered via virtio-gpu");
+}
+
+extern "C" fn lux_font_runner(parent_raw: u64) {
+    let parent = Term(parent_raw).as_pid().unwrap();
+    let r = lux_call_gc("font_scene", &[]);
+    assert_eq!(r, atoms::atom("true"), "font_scene returned false");
+    proc::send(parent, atoms::atom("lux_font_ok"));
+}
+
+fn lux_virgl_probe() {
+    let me = proc::current();
+    proc::spawn_with_heap(lux_virgl_runner, Term::pid(me).0, 1024);
+    let msg = proc::recv_timeout(30_000).expect("lux virgl probe never finished");
+    let code = msg.as_int().expect("virgl probe should return an int");
+    assert!(code == 0 || code == 1 || code == 2, "unexpected virgl probe {code}");
+    if code == 1 {
+        println!("[ok] lux virgl: 3d context created");
+    } else if code == 0 {
+        println!("[ok] lux virgl: 3d not offered");
+    } else {
+        println!("[ok] lux virgl: capset present, context create failed");
+    }
+}
+
+extern "C" fn lux_virgl_runner(parent_raw: u64) {
+    let parent = Term(parent_raw).as_pid().unwrap();
+    let r = lux_call_gc("virgl_probe", &[]);
+    proc::send(parent, r);
+}
+
+/// `virglprobe` cmdline: load the luxpack and report whether the gpu
+/// advertised a virgl capset and accepted CTX_CREATE.
+pub extern "C" fn virgl_visual(_arg: u64) {
+    let pack = crate::modload::boot_module_bytes("tcp_ip.luxpack").expect("no luxpack");
+    load_luxpack(pack).expect("bad luxpack");
+    let r = lux_call_gc("virgl_probe", &[]);
+    match r.as_int() {
+        Some(1) => println!("[virgl] context created"),
+        Some(0) => println!("[virgl] 3d not offered"),
+        Some(2) => println!("[virgl] capset present, context create failed"),
+        other => println!("[virgl] unexpected {other:?}"),
+    }
+    crate::qemu::exit(crate::qemu::ExitCode::Success);
 }
 
 extern "C" fn lux_gpu_runner(parent_raw: u64) {
@@ -855,6 +999,15 @@ pub extern "C" fn gpu_visual(_arg: u64) {
     println!("[gpu] static scene up; animation starts in 2s");
     let _ = proc::recv_timeout(2_000);
     let _ = lux_call_gc("animate", &[Term::int(1_000_000)]);
+}
+
+pub extern "C" fn terminal_visual(_arg: u64) {
+    let pack = crate::modload::boot_module_bytes("tcp_ip.luxpack").expect("no luxpack");
+    load_luxpack(pack).expect("bad luxpack");
+    proc::spawn_with_heap(tcp_repl_adapter, 0, 4096);
+    println!("[terminal] Lux ANSI terminal starting; serial stdin and TCP REPL are active");
+    let result = lux_call_gc("terminal", &[]);
+    panic!("Lux ANSI terminal exited unexpectedly: {result:?}");
 }
 
 // ---- M11 C1 spike: native fill through the gpu transport port ----
@@ -950,6 +1103,149 @@ fn lux_tcp_echo_live() {
 const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
 const GUEST_TCP_PORT: u16 = 7;
 
+fn tcp_listening(initial_sequence: i64) -> Term {
+    let ip_term = proc::build(|h| {
+        let mut pairs = [
+            (atoms::atom("a"), Term::int(GUEST_IP[0] as i64)),
+            (atoms::atom("b"), Term::int(GUEST_IP[1] as i64)),
+            (atoms::atom("c"), Term::int(GUEST_IP[2] as i64)),
+            (atoms::atom("d"), Term::int(GUEST_IP[3] as i64)),
+        ];
+        h.map_from_pairs(&mut pairs).map_err(|_| ygg_term::HeapFull)
+    });
+    lux_call_gc(
+        "listening",
+        &[ip_term, Term::int(GUEST_TCP_PORT as i64), Term::int(initial_sequence)],
+    )
+}
+
+fn tcp_repl_send(
+    port: Term,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    connection: Term,
+    payload: Term,
+) -> Term {
+    let step = lux_call_gc("tcp_send", &[connection, payload]);
+    tx_outbound(port, src_mac, dst_mac, step_field(step, "outbound"));
+    step_field(step, "connection")
+}
+
+fn tcp_repl_responses(delivered: Term, line: &mut Vec<u8>, overflowed: &mut bool) -> Vec<u8> {
+    let input = unsafe {
+        assert!(delivered.is_boxed() && delivered.kind() == ygg_term::Kind::Binary);
+        delivered.bin_bytes().to_vec()
+    };
+    let mut responses = Vec::new();
+    for byte in input {
+        match byte {
+            b'\r' => {}
+            b'\n' => {
+                if *overflowed {
+                    responses.extend_from_slice(b"\r\nline too long (1024 byte limit)\r\n\r\nlux> ");
+                } else {
+                    let line_term = proc::build(|h| h.binary(line));
+                    let reply = lux_call("repl_eval", &[line_term]);
+                    let reply_bytes = unsafe {
+                        assert!(reply.is_boxed() && reply.kind() == ygg_term::Kind::Binary);
+                        reply.bin_bytes()
+                    };
+                    responses.extend_from_slice(reply_bytes);
+                }
+                line.clear();
+                *overflowed = false;
+            }
+            8 | 127 => {
+                line.pop();
+            }
+            _ if line.len() < 1024 => line.push(byte),
+            _ => *overflowed = true,
+        }
+    }
+    responses
+}
+
+/// Serve a single remote REPL connection at a time. Ethernet and ARP stay in
+/// this adapter; the TCP state machine and expression evaluator are Lux.
+extern "C" fn tcp_repl_adapter(_arg: u64) {
+    let port = crate::ports::open(crate::ports::KIND_NET).expect("no virtio-net");
+    let mac = crate::virtio::net_mac();
+    let mut initial_sequence = 50_000i64;
+    let mut connection = tcp_listening(initial_sequence);
+    let mut line = Vec::new();
+    let mut overflowed = false;
+    println!(
+        "[tcp-repl] listening on {}.{}.{}.{}:{} (host 127.0.0.1:17888)",
+        GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3], GUEST_TCP_PORT
+    );
+
+    loop {
+        let frame = net_rx_wait(port);
+        if frame.len() >= 42 && frame[12..14] == [0x08, 0x06] && frame[20..22] == [0, 1] {
+            if frame[38..42] == GUEST_IP {
+                let mut reply = Vec::with_capacity(60);
+                reply.extend_from_slice(&frame[6..12]);
+                reply.extend_from_slice(&mac);
+                reply.extend_from_slice(&[0x08, 0x06, 0, 1, 8, 0, 6, 4, 0, 2]);
+                reply.extend_from_slice(&mac);
+                reply.extend_from_slice(&GUEST_IP);
+                reply.extend_from_slice(&frame[22..28]);
+                reply.extend_from_slice(&frame[28..32]);
+                reply.resize(60, 0);
+                net_tx(port, reply);
+            }
+            continue;
+        }
+        if frame.len() < 34 || frame[12..14] != [0x08, 0x00] || frame[23] != 6 {
+            continue;
+        }
+        let peer_mac: [u8; 6] = frame[6..12].try_into().unwrap();
+        let ip_len = u16::from_be_bytes([frame[16], frame[17]]) as usize;
+        if frame.len() < 14 + ip_len {
+            continue;
+        }
+
+        let packet_term = proc::build(|h| h.binary(&frame[14..14 + ip_len]));
+        let step = lux_call_gc("input", &[connection, packet_term]);
+        connection = step_field(step, "connection");
+        let event = step_field(step, "event").as_int().unwrap_or(0);
+        tx_outbound(port, mac, peer_mac, step_field(step, "outbound"));
+
+        if event == 1 {
+            println!("[tcp-repl] client connected");
+            line.clear();
+            overflowed = false;
+            let banner = lux_call("repl_banner", &[]);
+            connection = tcp_repl_send(port, mac, peer_mac, connection, banner);
+        } else if event == 2 {
+            let responses =
+                tcp_repl_responses(step_field(step, "delivered"), &mut line, &mut overflowed);
+            if !responses.is_empty() {
+                let response = proc::build(|h| h.binary(&responses));
+                connection = tcp_repl_send(port, mac, peer_mac, connection, response);
+            }
+        } else if event == 3 {
+            let close_step = lux_call_gc("close", &[connection]);
+            tx_outbound(port, mac, peer_mac, step_field(close_step, "outbound"));
+            // This is a single-client development REPL, so return to Listen as
+            // soon as the peer's FIN has been acknowledged. The final ACK for
+            // our FIN is harmless in Listen and a missing ACK cannot strand the
+            // service in LastAck forever.
+            initial_sequence += 10_000;
+            connection = tcp_listening(initial_sequence);
+            line.clear();
+            overflowed = false;
+            println!("[tcp-repl] client disconnected; listening");
+        } else if event == 4 || event == 5 {
+            initial_sequence += 10_000;
+            connection = tcp_listening(initial_sequence);
+            line.clear();
+            overflowed = false;
+            println!("[tcp-repl] connection reset; listening");
+        }
+    }
+}
+
 extern "C" fn tcp_echo_adapter(parent_raw: u64) {
     let parent = Term(parent_raw).as_pid().unwrap();
     let port = crate::ports::open(crate::ports::KIND_NET).expect("no virtio-net");
@@ -1035,6 +1331,15 @@ fn step_field(step: Term, name: &str) -> Term {
 fn net_rx(port: Term) -> Vec<u8> {
     use crate::ports::OP_READ;
     let r = port_request(port, OP_READ, 0, 0, 40);
+    assert!(r > 0, "net rx failed");
+    crate::ports::buf_take(r as u64).unwrap()
+}
+
+/// Blocking receive for long-lived network services. Unlike the self-test
+/// helper above, an idle connection is not treated as a failure.
+fn net_rx_wait(port: Term) -> Vec<u8> {
+    use crate::ports::OP_READ;
+    let r = port_request_wait(port, OP_READ, 0, 0, 42);
     assert!(r > 0, "net rx failed");
     crate::ports::buf_take(r as u64).unwrap()
 }
